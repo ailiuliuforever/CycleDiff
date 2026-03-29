@@ -1339,6 +1339,7 @@ class Modality_Unpair_dataset(data.Dataset):
         self.normalize_to_neg_one_to_one = normalize_to_neg_one_to_one
         self.transform = Compose([
             Resize(image_size),
+            RandomCrop((256, 256)),
             RandomHorizontalFlip() if augment_horizontal_flip else Identity(),
             # ToTensor()
         ])
@@ -1707,6 +1708,7 @@ class Single_dataset_edge(data.Dataset):
         self.normalize_to_neg_one_to_one = normalize_to_neg_one_to_one
         self.transform = Compose([
             Resize(image_size),
+            T.RandomCrop((256, 256)),
             RandomHorizontalFlip() if augment_horizontal_flip else Identity(),
             # ToTensor()
         ])
