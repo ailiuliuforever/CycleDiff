@@ -21,7 +21,8 @@ def parse_args():
     parser = argparse.ArgumentParser(description="training vae configure")
     parser.add_argument("--cfg", help="experiment configure file name", type=str, required=True)
     args = parser.parse_args()
-    args.cfg = load_conf(args.cfg)
+    args.cfg_path = args.cfg  # 保存原始配置文件路径
+    args.cfg = load_conf(args.cfg)  # 加载配置文件内容
     return args
 
 
@@ -35,9 +36,19 @@ def load_conf(config_file, conf={}):
 
 def extract_experiment_name(cfg_path):
     """从配置文件路径提取实验名称"""
+    if not cfg_path:
+        return "vae_experiment"
+    
+    # 提取文件名（不含路径和.yaml 后缀）
     match = re.search(r'([^/]+)\.yaml$', cfg_path)
     if match:
         return match.group(1)
+    
+    # 备用方案：直接使用路径最后一部分
+    basename = os.path.basename(cfg_path)
+    if basename:
+        return basename.replace('.yaml', '').replace('.yml', '')
+    
     return "vae_experiment"
 
 
@@ -53,7 +64,8 @@ def main(args):
                     num_workers=2)
     train_cfg = cfg['trainer']
     
-    experiment_name = extract_experiment_name(args.cfg.get('cfg_path', args.cfg.get('config_file', 'vae_config')))
+    # 使用保存的原始配置文件路径
+    experiment_name = extract_experiment_name(args.cfg_path)
     
     swanlab.init(
         project="CycleDiff-RSI2Map",
