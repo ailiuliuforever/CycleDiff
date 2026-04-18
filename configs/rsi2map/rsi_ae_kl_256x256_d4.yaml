@@ -2,7 +2,7 @@ model:
   class_name: ddm.encoder_decoder.AutoencoderKL
   embed_dim: 3
   lossconfig:
-    disc_start: 20001
+    disc_start: 10001
     kl_weight: 0.000001
     disc_weight: 0.5
   ddconfig:
@@ -16,7 +16,7 @@ model:
     num_res_blocks: 2
     attn_resolutions: [ ]
     dropout: 0.0
-  ckpt_path: ""
+  ckpt_path: "/root/autodl-tmp/CycleDiff/kl-f4/model.ckpt"
 
 data:
   class_name: ddm.data.Single_dataset
@@ -25,14 +25,14 @@ data:
   image_size: [286, 286]
   data_root: "/root/autodl-tmp/CycleDiff/datasets/AIDOMG-public/AIDOMG_Beijing_RSI2Map"
   augment_horizontal_flip: True
-  batch_size: 8
+  batch_size: 12
   num_workers: 4
 
 trainer:
   gradient_accumulate_every: 2
   lr: !!float 5e-6
   min_lr: !!float 1e-6
-  train_num_steps: 50000
+  train_num_steps: 30000
   save_and_sample_every: 5000
   log_freq: 200
   resume_milestone: 0
