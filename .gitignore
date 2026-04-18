@@ -3,6 +3,7 @@ datasets/
 .trae/
 kl-f4/
 results/
+evaluation/vae/res
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
