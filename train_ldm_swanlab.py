@@ -18,7 +18,6 @@ import swanlab
 import os
 import re
 
-
 def parse_args():
     parser = argparse.ArgumentParser(description="training vae configure")
     parser.add_argument("--cfg", help="experiment configure file name", type=str, required=True)
