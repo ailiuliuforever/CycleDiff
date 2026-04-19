@@ -291,16 +291,17 @@ class Trainer(object):
                 self.opt.zero_grad()
                 self.lr_scheduler.step()
                 if accelerator.is_main_process:
-                    self.writer.add_scalar('Learning_Rate', self.opt.param_groups[0]['lr'], self.step)
-                    self.writer.add_scalar('total_loss', total_loss, self.step)
-                    self.writer.add_scalar('loss_simple', loss_simple, self.step)
-                    self.writer.add_scalar('loss_vlb', loss_vlb, self.step)
+                    # 使用累加后的值记录到 TensorBoard 和 SwanLab
+                    self.writer.add_scalar('Learning_Rate', total_loss_dict['lr'], self.step)
+                    self.writer.add_scalar('total_loss', total_loss_dict['total_loss'], self.step)
+                    self.writer.add_scalar('loss_simple', total_loss_dict['loss_simple'], self.step)
+                    self.writer.add_scalar('loss_vlb', total_loss_dict['loss_vlb'], self.step)
                     
                     swanlab.log({
-                        'Learning_Rate': self.opt.param_groups[0]['lr'],
-                        'total_loss': total_loss,
-                        'loss_simple': loss_simple,
-                        'loss_vlb': loss_vlb,
+                        'Learning_Rate': total_loss_dict['lr'],
+                        'total_loss': total_loss_dict['total_loss'],
+                        'loss_simple': total_loss_dict['loss_simple'],
+                        'loss_vlb': total_loss_dict['loss_vlb'],
                     })
 
                 accelerator.wait_for_everyone()
