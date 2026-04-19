@@ -61,8 +61,8 @@ data:
   image_size: [ 286, 286 ]
   data_root: "/root/autodl-tmp/CycleDiff/datasets/AIDOMG-public/AIDOMG_Beijing_RSI2Map"
   augment_horizontal_flip: True
-  batch_size: 16
-  num_workers: 4
+  batch_size: 96
+  num_workers: 8
 
 trainer:
   gradient_accumulate_every: 2

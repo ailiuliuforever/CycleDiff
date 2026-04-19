@@ -38,7 +38,7 @@ model:
       num_res_blocks: 2
       attn_resolutions: [ ]
       dropout: 0.0
-    ckpt_path: "/root/autodl-tmp/CycleDiff/results/rsi_ae_kl_256x256_d4/model-10.pt"
+    ckpt_path: "/root/autodl-tmp/CycleDiff/results/rsi_ae_kl_256x256_d4/model-6.pt"
   unet:
     class_name: unet.uncond_unet_sd_2.EDMPrecond
     img_resolution: 64
