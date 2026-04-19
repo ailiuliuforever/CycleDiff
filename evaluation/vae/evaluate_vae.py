@@ -476,6 +476,15 @@ def create_comparison_grid(original, reconstructed, num_images=8):
     original = original[:num_images]
     reconstructed = reconstructed[:num_images]
     
+    # 如果尺寸不匹配，将重建图像 resize 到原始图像尺寸
+    if original.shape[-2:] != reconstructed.shape[-2:]:
+        reconstructed = torch.nn.functional.interpolate(
+            reconstructed, 
+            size=original.shape[-2:], 
+            mode='bilinear', 
+            align_corners=False
+        )
+    
     # 创建交替排列的网格
     comparison = []
     for i in range(len(original)):
