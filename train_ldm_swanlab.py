@@ -60,7 +60,8 @@ def main(args):
     first_stage_model = construct_class_by_name(**first_stage_cfg)
     unet_cfg = model_cfg.unet
     unet = construct_class_by_name(**unet_cfg)
-    model_kwargs = {"model": unet, "auto_encoder": first_stage_model, "cfg": model_cfg}
+    model_kwargs = {"model": unet,
+                    "auto_encoder": first_stage_model, "cfg": model_cfg}
     model_kwargs.update(model_cfg)
     ldm = construct_class_by_name(**model_kwargs)
     model_kwargs.pop("model")
@@ -114,7 +115,7 @@ def main(args):
         resume_milestone=train_cfg.resume_milestone,
         train_wd=train_cfg.get("weight_decay", 1e-4),
     )
-    
+
     if train_cfg.test_before:
         with torch.no_grad():
             for datatmp in dl:
@@ -131,7 +132,7 @@ def main(args):
             nrow=nrow,
         )
         torch.cuda.empty_cache()
-    
+
     trainer.train()
     swanlab.finish()
     pass
@@ -174,6 +175,7 @@ class Trainer(object):
         assert has_int_squareroot(
             num_samples
         ), "number of samples must have an integer square root"
+
         self.num_samples = num_samples
         self.save_and_sample_every = save_and_sample_every
 
@@ -203,6 +205,7 @@ class Trainer(object):
             lr=train_lr,
             weight_decay=train_wd,
         )
+        
         self.lr_scheduler = torch.optim.lr_scheduler.LambdaLR(
             self.opt, lr_lambda=WarmUpLrScheduler
         )
@@ -256,12 +259,9 @@ class Trainer(object):
         self.lr_scheduler.load_state_dict(data["lr_scheduler"])
         self.ema.load_state_dict(data["ema"])
         if "scale_factor" in data["model"]:
-            if self.cfg.model.scale_factor != None:
-                self.model.scale_factor = torch.tensor(
-                    self.cfg.model.scale_factor, device=device
-                )
-            else:
-                self.model.scale_factor = data["model"]["scale_factor"]
+            # 恢复训练时始终使用检查点中保存的 scale_factor
+            # 以保证训练的一致性和连续性
+            self.model.scale_factor = data["model"]["scale_factor"]
 
         if exists(self.accelerator.scaler) and exists(data["scaler"]):
             self.accelerator.scaler.load_state_dict(data["scaler"])
@@ -315,7 +315,8 @@ class Trainer(object):
                 total_loss_dict["lr"] = self.opt.param_groups[0]["lr"]
                 describtions = dict2str(total_loss_dict)
                 describtions = (
-                    "[Train Step] {}/{}: ".format(self.step, self.train_num_steps)
+                    "[Train Step] {}/{}: ".format(self.step,
+                                                  self.train_num_steps)
                     + describtions
                 )
                 pbar.desc = describtions
@@ -324,7 +325,8 @@ class Trainer(object):
                     print(describtions)
 
                 accelerator.clip_grad_norm_(
-                    filter(lambda p: p.requires_grad, self.model.parameters()), 1.0
+                    filter(lambda p: p.requires_grad,
+                           self.model.parameters()), 1.0
                 )
 
                 self.opt.step()
