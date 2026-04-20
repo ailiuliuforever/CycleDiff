@@ -293,32 +293,34 @@ class Trainer(object):
                     for key in batch.keys():
                         if isinstance(batch[key], torch.Tensor):
                             batch[key] = batch[key].to(device)
-                if isinstance(self.model, nn.Module):
-                    self.model.on_train_batch_start(batch)
+                    
+                    if isinstance(self.model, nn.Module):
+                        self.model.on_train_batch_start(batch)
 
-                    # 混合精度训练
-                    with torch.cuda.amp.autocast(enabled=self.amp or self.fp16, dtype=self.dtype):
-                        loss, log_dict = self.model.training_step(batch)
+                        # 混合精度训练
+                        with torch.cuda.amp.autocast(enabled=self.amp or self.fp16, dtype=self.dtype):
+                            loss, log_dict = self.model.training_step(batch)
 
-                        loss = loss / self.gradient_accumulate_every
-                        total_loss += loss.item()
+                            loss = loss / self.gradient_accumulate_every
+                            total_loss += loss.item()
 
-                        loss_simple = (
-                            log_dict["train/loss_simple"].item()
-                            / self.gradient_accumulate_every
-                        )
-                        loss_vlb = (
-                            log_dict["train/loss_vlb"].item()
-                            / self.gradient_accumulate_every
-                        )
-                        total_loss_dict["loss_simple"] += loss_simple
-                        total_loss_dict["loss_vlb"] += loss_vlb
+                            loss_simple = (
+                                log_dict["train/loss_simple"].item()
+                                / self.gradient_accumulate_every
+                            )
+                            loss_vlb = (
+                                log_dict["train/loss_vlb"].item()
+                                / self.gradient_accumulate_every
+                            )
+                            total_loss_dict["loss_simple"] += loss_simple
+                            total_loss_dict["loss_vlb"] += loss_vlb
 
-                    # 反向传播
-                    if self.scaler:
-                        self.scaler.scale(loss).backward()
-                    else:
-                        loss.backward()
+                        # 反向传播（累积梯度）
+                        if self.scaler:
+                            self.scaler.scale(loss).backward()
+                        else:
+                            loss.backward()
+                
                 total_loss_dict["total_loss"] = total_loss
                 total_loss_dict["lr"] = self.opt.param_groups[0]["lr"]
                 describtions = dict2str(total_loss_dict)
@@ -336,7 +338,7 @@ class Trainer(object):
                 torch.nn.utils.clip_grad_norm_(
                     filter(lambda p: p.requires_grad, self.model.parameters()), 1.0)
 
-                # 优化器步骤
+                # 优化器步骤（在所有累积batch之后）
                 if self.scaler:
                     self.scaler.step(self.opt)
                     self.scaler.update()
