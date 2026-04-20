@@ -5,7 +5,6 @@ import torch
 import torch.nn as nn
 from tqdm.auto import tqdm
 from ddm.ema import EMA
-from accelerate import Accelerator
 from ddm.utils import *
 import torchvision as tv
 from ddm.encoder_decoder import AutoencoderKL
@@ -158,19 +157,29 @@ class Trainer(object):
         cfg={},
     ):
         super().__init__()
+
+        # 设置设备
+        self.device = torch.device(
+            'cuda' if torch.cuda.is_available() else 'cpu')
+        print(f"Using device: {self.device}")
+
+        # 混合精度配置
+        self.amp = amp
+        self.fp16 = fp16
         if fp16:
-            mp = "fp16"
+            self.dtype = torch.float16
         elif amp:
-            mp = "bf16"
+            self.dtype = torch.bfloat16
         else:
-            mp = "no"
-        self.accelerator = Accelerator(
-            mixed_precision=mp,
-        )
+            self.dtype = torch.float32
+
+        # 梯度缩放器（用于混合精度训练）
+        self.scaler = torch.amp.GradScaler('cuda') if (
+            amp or fp16) and self.device.type == 'cuda' else None
 
         self.cfg = cfg
 
-        self.model = model
+        self.model = model.to(self.device)
 
         assert has_int_squareroot(
             num_samples
@@ -205,7 +214,7 @@ class Trainer(object):
             lr=train_lr,
             weight_decay=train_wd,
         )
-        
+
         self.lr_scheduler = torch.optim.lr_scheduler.LambdaLR(
             self.opt, lr_lambda=WarmUpLrScheduler
         )
@@ -219,6 +228,7 @@ class Trainer(object):
             update_after_step=cfg.trainer.ema_update_after_step,
             update_every=cfg.trainer.ema_update_every,
         )
+        self.ema.to(self.device)
 
         self.step = 0
 
@@ -229,29 +239,23 @@ class Trainer(object):
     def save(self, milestone):
         data = {
             "step": self.step,
-            "model": self.accelerator.get_state_dict(self.model),
+            "model": self.model.state_dict(),
             "opt": self.opt.state_dict(),
             "lr_scheduler": self.lr_scheduler.state_dict(),
             "ema": self.ema.state_dict(),
-            "scaler": (
-                self.accelerator.scaler.state_dict()
-                if exists(self.accelerator.scaler)
-                else None
-            ),
+            "scaler": self.scaler.state_dict() if self.scaler else None,
         }
 
         torch.save(data, str(self.results_folder / f"model-{milestone}.pt"))
 
     def load(self, milestone):
-        accelerator = self.accelerator
-        device = accelerator.device
+        device = self.device
 
         data = safe_torch_load(
             str(self.results_folder / f"model-{milestone}.pt"),
-            map_location=lambda storage, loc: storage,
+            map_location=device,
         )
 
-        self.model = self.accelerator.unwrap_model(self.model)
         self.model.load_state_dict(data["model"])
 
         self.step = data["step"]
@@ -263,14 +267,13 @@ class Trainer(object):
             # 以保证训练的一致性和连续性
             self.model.scale_factor = data["model"]["scale_factor"]
 
-        if exists(self.accelerator.scaler) and exists(data["scaler"]):
-            self.accelerator.scaler.load_state_dict(data["scaler"])
+        if self.scaler and data.get("scaler"):
+            self.scaler.load_state_dict(data["scaler"])
 
         print(f"### USING DEFAULT SCALE {self.model.scale_factor}")
 
     def train(self):
-        accelerator = self.accelerator
-        device = accelerator.device
+        device = self.device
 
         with tqdm(
             initial=self.step,
@@ -289,11 +292,12 @@ class Trainer(object):
                     batch = next(self.dl)
                     for key in batch.keys():
                         if isinstance(batch[key], torch.Tensor):
-                            batch[key].to(device)
+                            batch[key] = batch[key].to(device)
                 if isinstance(self.model, nn.Module):
                     self.model.on_train_batch_start(batch)
 
-                    with self.accelerator.autocast():
+                    # 混合精度训练
+                    with torch.cuda.amp.autocast(enabled=self.amp or self.fp16, dtype=self.dtype):
                         loss, log_dict = self.model.training_step(batch)
 
                         loss = loss / self.gradient_accumulate_every
@@ -310,7 +314,11 @@ class Trainer(object):
                         total_loss_dict["loss_simple"] += loss_simple
                         total_loss_dict["loss_vlb"] += loss_vlb
 
-                    self.accelerator.backward(loss)
+                    # 反向传播
+                    if self.scaler:
+                        self.scaler.scale(loss).backward()
+                    else:
+                        loss.backward()
                 total_loss_dict["total_loss"] = total_loss
                 total_loss_dict["lr"] = self.opt.param_groups[0]["lr"]
                 describtions = dict2str(total_loss_dict)
@@ -324,12 +332,16 @@ class Trainer(object):
                 if self.step % self.log_freq == 0:
                     print(describtions)
 
-                accelerator.clip_grad_norm_(
-                    filter(lambda p: p.requires_grad,
-                           self.model.parameters()), 1.0
-                )
+                # 梯度裁剪
+                torch.nn.utils.clip_grad_norm_(
+                    filter(lambda p: p.requires_grad, self.model.parameters()), 1.0)
 
-                self.opt.step()
+                # 优化器步骤
+                if self.scaler:
+                    self.scaler.step(self.opt)
+                    self.scaler.update()
+                else:
+                    self.opt.step()
                 self.opt.zero_grad()
                 self.lr_scheduler.step()
                 swanlab.log(
@@ -374,7 +386,7 @@ class Trainer(object):
 
                 pbar.update(1)
 
-        accelerator.print("training complete")
+        print("training complete")
 
 
 if __name__ == "__main__":
