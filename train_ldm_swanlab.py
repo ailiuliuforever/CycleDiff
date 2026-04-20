@@ -143,7 +143,7 @@ class Trainer(object):
         ddp_handler = DistributedDataParallelKwargs(find_unused_parameters=True)
         self.accelerator = Accelerator(
             split_batches=split_batches,
-            mixed_precision='fp16' if fp16 else 'no',
+            mixed_precision='fp16' if (fp16 or amp) else 'no',
             kwargs_handlers=[ddp_handler],
         )
 
