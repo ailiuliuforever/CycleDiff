@@ -3,11 +3,12 @@
 """
 LDM 模型评估脚本
 功能：
-评估从图像分量（C列表）重建原始图像的能力
+统一评估 LDM 模型的「图像分量提取」能力和「基于提取的图像分量重建RGB图像」的能力
 
-采样流程说明：
-- 参考 train_ldm_swanlab2.py 中训练过程的采样流程（第321-342行）
-- 从噪声开始，UNet预测noise，用预提取的C替换UNet预测的C，逐步去噪
+评估流程：
+1. 图像分量提取：使用 reverse_q_sample_c_list_concat 从图像提取 C 列表和最终噪声状态 x_t
+2. 图像重建：使用模型内置的 sample_from_c_list 方法，从提取的 C 列表和 x_t 重建 RGB 图像
+   （参考 translation_uncond_ldm_cycle.py 中将翻译后的图像分量生成 RGB 图像的方法）
 """
 
 import sys
@@ -17,10 +18,9 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspa
 import torch
 import yaml
 import argparse
-import copy
 import torchvision as tv
 from torch.utils.data import DataLoader
-from ddm.utils import construct_class_by_name, safe_torch_load, unnormalize_to_zero_to_one
+from ddm.utils import construct_class_by_name, safe_torch_load
 from ddm.encoder_decoder import AutoencoderKL
 from util.mse_psnr_ssim_mssim import calculate_mse, calculate_psnr, calculate_ssim, calculate_msssim
 import numpy as np
@@ -91,77 +91,6 @@ def load_ldm_model(cfg, ckpt_path, device):
     return model
 
 
-def sample_from_c_list_correct(model, batch_size, c_list, device):
-    """
-    使用与训练脚本 sample_fn_d 相同的采样流程，但用预提取的 C 替换 UNet 预测的 C。
-    
-    参考 train_ldm_swanlab2.py 第321-342行的采样流程：
-    1. 从噪声开始（与 sample_fn_d 一致）
-    2. UNet 预测 C 和 noise
-    3. 用预提取的 C 替换 UNet 预测的 C
-    4. 使用 UNet 预测的 noise
-    5. 逐步去噪重建图像
-    
-    Args:
-        model: LatentDiffusion 模型
-        batch_size: batch size
-        c_list: 预提取的 C 列表（从 reverse_q_sample_c_list_concat 获取）
-        device: 设备
-    
-    Returns:
-        x_rec: 重建图像 [0, 1] 归一化
-    """
-    sampling_timesteps = model.sampling_timesteps
-    step = 1. / sampling_timesteps
-    rho = 1.
-    
-    step_indices = torch.arange(sampling_timesteps, dtype=torch.float64, device=device)
-    t_steps = (model.sigma_max ** (1 / rho) + step_indices / (sampling_timesteps - 1) * (
-            step - model.sigma_max ** (1 / rho))) ** rho
-    t_steps = torch.cat([t_steps, torch.zeros_like(t_steps[:1])])
-    
-    image_size = model.image_size
-    channels = model.channels
-    down_ratio = model.first_stage_model.down_ratio
-    shape = (batch_size, channels, image_size[0] // down_ratio, image_size[1] // down_ratio)
-    
-    # 从噪声开始，与 sample_fn_d 一致
-    x_next = torch.randn(shape, device=device, dtype=torch.float64) * t_steps[0]
-    
-    # c_list 是从 reverse_q_sample_c_list_concat 获取的
-    # 需要反转以匹配 t_steps 的顺序（从小到大）
-    c_list_reversed = list(reversed(c_list))
-    
-    for i, (t_cur, t_next) in enumerate(zip(t_steps[:-1], t_steps[1:])):
-        x_cur = x_next
-        pred = model.model(x_cur, t_cur)
-        _, noise = pred[:2]
-        
-        # 用预提取的 C 替换 UNet 预测的 C
-        if i < len(c_list_reversed):
-            C = c_list_reversed[i].to(torch.float64)
-        else:
-            # 如果 C 列表不够长，使用 UNet 预测的 C
-            C = pred[0].to(torch.float64)
-        
-        noise = noise.to(torch.float64)
-        x0 = x_cur - C * t_cur - noise * t_cur
-        x_next = x0 + t_next * C + t_next * noise
-    
-    z = x_next
-    
-    # 反缩放（与 sample() 方法一致）
-    if model.scale_by_std:
-        z = 1. / model.scale_factor * z.detach()
-    
-    # VAE 解码（与 sample() 方法一致）
-    x_rec = model.first_stage_model.decode(z.to(torch.float32))
-    x_rec = unnormalize_to_zero_to_one(x_rec)
-    x_rec = torch.clamp(x_rec, min=0., max=1.)
-    
-    return x_rec
-
-
 def create_dual_comparison_grid(original, reconstructed, num_images=4):
     """创建双对比图（原始 vs 重建）"""
     original = original[:num_images]
@@ -201,7 +130,7 @@ def evaluate_reconstruction_from_c(model, dataloader, save_dir, device, num_samp
     comparison_grids = []
 
     print("正在评估从图像分量重建原始图像的能力...")
-    print("  采样流程：从噪声开始 → UNet预测noise → 用预提取C替换UNet预测的C → 逐步去噪")
+    print("  采样流程：提取C列表和x_t → 使用模型内置 sample_from_c_list 从C列表重建RGB图像")
 
     with torch.no_grad():
         for batch_idx, batch in enumerate(dataloader):
@@ -211,10 +140,9 @@ def evaluate_reconstruction_from_c(model, dataloader, save_dir, device, num_samp
             img = batch['image'].to(device)
             batch_size = img.shape[0]
 
-            c_list, _ = model.reverse_q_sample_c_list_concat(img)
+            c_list, x_t = model.reverse_q_sample_c_list_concat(img)
 
-            # 使用修正后的采样函数
-            x_rec = sample_from_c_list_correct(model, batch_size, c_list, device)
+            x_rec = model.sample_from_c_list(batch_size=batch_size, c_list=list(c_list) + [x_t])
 
             img_display = (img + 1.0) / 2.0
 
@@ -301,8 +229,8 @@ def calculate_lpips(model, dataloader, device, num_samples=50):
 
             img = batch['image'].to(device)
 
-            c_list, _ = model.reverse_q_sample_c_list_concat(img)
-            x_rec = sample_from_c_list_correct(model, img.shape[0], c_list, device)
+            c_list, x_t = model.reverse_q_sample_c_list_concat(img)
+            x_rec = model.sample_from_c_list(batch_size=img.shape[0], c_list=list(c_list) + [x_t])
 
             x_rec_norm = x_rec * 2.0 - 1.0
 
