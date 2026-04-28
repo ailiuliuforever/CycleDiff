@@ -124,6 +124,12 @@ def main(args):
         data_cfg = cfg.data_test
     elif cfg.sampler.task == "cityscape2label":
         data_cfg = cfg.data_test2
+    elif cfg.sampler.task == "rsi2map":
+        data_cfg = cfg.data_test
+    elif cfg.sampler.task == "map2rsi":
+        data_cfg = cfg.data_test2
+    else:
+        raise ValueError(f"Unknown task: {cfg.sampler.task}. Supported tasks include: cat2dog, dog2cat, wild2dog, dog2wild, male2female, female2male, sem2rgb, rgb2sem, edge2rgb, rgb2edge, depth2rgb, rgb2depth, summer2winter, winter2summer, horse2zebra, zebra2horse, young2old, old2young, map2satellite, satellite2map, label2cityscape, cityscape2label, rsi2map, map2rsi")
 
     dataset = construct_class_by_name(**data_cfg)
     dl = DataLoader(dataset, batch_size=cfg.sampler.batch_size, shuffle=False, pin_memory=True,
@@ -277,7 +283,7 @@ class Sampler(object):
 
                 if "cat2dog" in self.cfg.sampler.task or "wild2dog" in self.cfg.sampler.task or "male2female" in self.cfg.sampler.task or "sem2rgb" in self.cfg.sampler.task or\
                     "depth2rgb" in self.cfg.sampler.task or "edge2rgb" in self.cfg.sampler.task or "summer2winter" in self.cfg.sampler.task or "horse2zebra" in self.cfg.sampler.task or \
-                    "young2old" in self.cfg.sampler.task or "map2satellite" in self.cfg.sampler.task or "label2cityscape" in self.cfg.sampler.task:
+                    "young2old" in self.cfg.sampler.task or "map2satellite" in self.cfg.sampler.task or "label2cityscape" in self.cfg.sampler.task or "rsi2map" in self.cfg.sampler.task:
                     src_img = batch["image"]
                     x_s = self.get_latent_space(src_img, tag="src_img")
 
@@ -336,19 +342,51 @@ class Sampler(object):
                     if idx % log_image_freq == 0:
                         if "cat2dog" in task or "wild2dog" in task or "male2female" in task or "sem2rgb" in task or \
                            "depth2rgb" in task or "edge2rgb" in task or "summer2winter" in task or "horse2zebra" in task or \
-                           "young2old" in task or "map2satellite" in task or "label2cityscape" in task:
+                           "young2old" in task or "map2satellite" in task or "label2cityscape" in task or "rsi2map" in task:
                             source_image = src_img
                         else:
                             source_image = trg_img
                         
                         try:
+                            # 确保传入 swanlab.Image 的数据在 [0, 1] 范围
+                            # swanlab.Image 内部使用 torchvision.utils.make_grid(..., normalize=True)
+                            # 如果数据范围已经是 [0, 1]，需要避免被重新归一化
+                            # 通过转换为 PIL.Image 来绕过 make_grid 的 normalize 处理
+                            from torchvision.transforms import ToPILImage
+                            to_pil = ToPILImage()
+                            
+                            # 处理 source_image: 可能是 [-1, 1] 或 [0, 1]
+                            if isinstance(source_image, torch.Tensor):
+                                if source_image.min() < 0:
+                                    source_display = (source_image + 1) / 2
+                                else:
+                                    source_display = source_image
+                                source_display = torch.clamp(source_display, 0, 1)
+                                # 转换为 PIL.Image 避免 make_grid 的 normalize
+                                if source_display.dim() == 4:
+                                    source_pil = to_pil(source_display[0].cpu())
+                                else:
+                                    source_pil = to_pil(source_display.cpu())
+                            else:
+                                source_pil = source_image
+                            
+                            # 处理 pred_img: 应该已经是 [0, 1]，但确保无误
+                            if isinstance(pred_img, torch.Tensor):
+                                pred_display = torch.clamp(pred_img, 0, 1)
+                                if pred_display.dim() == 4:
+                                    pred_pil = to_pil(pred_display[0].cpu())
+                                else:
+                                    pred_pil = to_pil(pred_display.cpu())
+                            else:
+                                pred_pil = pred_img
+                            
                             swanlab.log({
                                 "translation_samples/source": swanlab.Image(
-                                    source_image,
+                                    source_pil,
                                     caption=f"Task: {task}, Batch: {idx}, Source Images"
                                 ),
                                 "translation_samples/translated": swanlab.Image(
-                                    pred_img,
+                                    pred_pil,
                                     caption=f"Task: {task}, Batch: {idx}, Translated Images"
                                 )
                             }, step=idx)

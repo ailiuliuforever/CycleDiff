@@ -748,13 +748,29 @@ class Trainer(object):
                             self.save_img(pred_img_src, milestone, tag=f"pred-translation-B2A")
                             
                             try:
+                                # 修复 SwanLab 图像颜色问题：转换为 PIL.Image 避免 make_grid 的 normalize 处理
+                                from torchvision.transforms import ToPILImage
+                                to_pil = ToPILImage()
+                                
+                                def tensor_to_pil(img_tensor):
+                                    """将 [0, 1] 或 [-1, 1] 的 tensor 转换为 PIL.Image"""
+                                    if img_tensor.min() < 0:
+                                        img_display = (img_tensor + 1) / 2
+                                    else:
+                                        img_display = img_tensor
+                                    img_display = torch.clamp(img_display, 0, 1)
+                                    if img_display.dim() == 4:
+                                        return to_pil(img_display[0].cpu())
+                                    else:
+                                        return to_pil(img_display.cpu())
+                                
                                 swanlab.log({
-                                    "samples/source_A": swanlab.Image(src_img, caption=f"Source A at step {self.step}"),
-                                    "samples/source_B": swanlab.Image(trg_img, caption=f"Source B at step {self.step}"),
-                                    "samples/model_A": swanlab.Image(pred_model1, caption=f"Model A Sample at step {self.step}"),
-                                    "samples/model_B": swanlab.Image(pred_model2, caption=f"Model B Sample at step {self.step}"),
-                                    "samples/translation_A2B": swanlab.Image(pred_img_trg, caption=f"A→B Translation at step {self.step}"),
-                                    "samples/translation_B2A": swanlab.Image(pred_img_src, caption=f"B→A Translation at step {self.step}"),
+                                    "samples/source_A": swanlab.Image(tensor_to_pil(src_img), caption=f"Source A at step {self.step}"),
+                                    "samples/source_B": swanlab.Image(tensor_to_pil(trg_img), caption=f"Source B at step {self.step}"),
+                                    "samples/model_A": swanlab.Image(tensor_to_pil(pred_model1), caption=f"Model A Sample at step {self.step}"),
+                                    "samples/model_B": swanlab.Image(tensor_to_pil(pred_model2), caption=f"Model B Sample at step {self.step}"),
+                                    "samples/translation_A2B": swanlab.Image(tensor_to_pil(pred_img_trg), caption=f"A→B Translation at step {self.step}"),
+                                    "samples/translation_B2A": swanlab.Image(tensor_to_pil(pred_img_src), caption=f"B→A Translation at step {self.step}"),
                                 }, step=self.step)
                             except Exception as e:
                                 print(f"Warning: Failed to log images to SwanLab at step {self.step}: {e}")
