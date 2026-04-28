@@ -24,7 +24,7 @@ model:
     class_name: ddm.encoder_decoder.AutoencoderKL
     embed_dim: 3
     lossconfig:
-      disc_start: 10001
+      disc_start: 20001
       kl_weight: 0.000001
       disc_weight: 0.5
     ddconfig:
@@ -38,7 +38,8 @@ model:
       num_res_blocks: 2
       attn_resolutions: [ ]
       dropout: 0.0
-    ckpt_path: "/root/autodl-tmp/CycleDiff/results/maps_rsi_ae_kl_256x256_d4/model-10.pt"
+    ckpt_path: "/root/autodl-tmp/CycleDiff/results/rsi_ae_kl_256x256_d4/model-6.pt"
+
   unet:
     class_name: unet.uncond_unet_sd_2.EDMPrecond
     img_resolution: 64
@@ -61,8 +62,8 @@ data:
   image_size: [ 286, 286 ]
   data_root: "/root/autodl-tmp/CycleDiff/datasets/maps"
   augment_horizontal_flip: True
-  batch_size: 96
-  num_workers: 8
+  batch_size: 120
+  num_workers: 10
 
 trainer:
   gradient_accumulate_every: 2
@@ -71,10 +72,11 @@ trainer:
   train_num_steps: 400000
   save_and_sample_every: 10000
   log_freq: 500
-  results_folder: "/root/autodl-tmp/CycleDiff/results/ddm_const_uncond_unet_ldm_maps_rsi"
+  results_folder: "/root/autodl-tmp/CycleDiff/results/maps/ddm_const_uncond_unet_ldm_rsi_2"
   amp: False
   fp16: False
   resume_milestone: 0
   test_before: True
   ema_update_after_step: 20000
   ema_update_every: 8
+  warmup_iter: 5000
