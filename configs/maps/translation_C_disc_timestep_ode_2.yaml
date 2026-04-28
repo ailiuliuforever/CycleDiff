@@ -38,7 +38,7 @@ model1:
       num_res_blocks: 2
       attn_resolutions: [ ]
       dropout: 0.0
-    ckpt_path: "/root/autodl-tmp/CycleDiff/results/maps_rsi_ae_kl_256x256_d4/model-10.pt"
+    ckpt_path: "/root/autodl-tmp/CycleDiff/results/rsi_ae_kl_256x256_d4/model-6.pt"
   unet:
     class_name: unet.uncond_unet_sd_2.EDMPrecond
     img_resolution: 64
@@ -95,7 +95,7 @@ model2:
       num_res_blocks: 2
       attn_resolutions: [ ]
       dropout: 0.0
-    ckpt_path: "/root/autodl-tmp/CycleDiff/results/maps_map_ae_kl_256x256_d4/model-10.pt"
+    ckpt_path: "/root/autodl-tmp/CycleDiff/results/map_ae_kl_256x256_d4/model-10.pt"
   unet:
     class_name: unet.uncond_unet_sd_2.EDMPrecond
     img_resolution: 64
@@ -132,7 +132,7 @@ data:
   image_size: [ 286, 286 ]
   data_root: "/root/autodl-tmp/CycleDiff/datasets/maps"
   augment_horizontal_flip: True
-  batch_size: 16
+  batch_size: 20
   num_workers: 4
 
 trainer:
@@ -144,7 +144,7 @@ trainer:
   save_every: 5000
   sample_every: 5000
   log_freq: 500
-  results_folder: "/root/autodl-tmp/CycleDiff/results/train_cycle_C_disc_G_blocks_12_maps_rsi2map"
+  results_folder: "/root/autodl-tmp/CycleDiff/results/maps/train_cycle_C_disc_G_blocks_12_maps_rsi2map"
   amp: False
   fp16: False
   resume_milestone: 0
@@ -152,8 +152,8 @@ trainer:
   ema_update_after_step: 20000
   ema_update_every: 8
   ft_use_ema: True
-  ckpt_path1: "/root/autodl-tmp/CycleDiff/results/ddm_const_uncond_unet_ldm_maps_rsi/model-24.pt"
-  ckpt_path2: "/root/autodl-tmp/CycleDiff/results/ddm_const_uncond_unet_ldm_maps_map/model-21.pt"
+  ckpt_path1: "/root/autodl-tmp/CycleDiff/results/maps/ddm_const_uncond_unet_ldm_rsi_2/model-5.pt"
+  ckpt_path2: "/root/autodl-tmp/CycleDiff/results/maps/ddm_const_uncond_unet_ldm_map/model-10.pt"
   # for mcl loss
   temp: 0.1
   mcl_weight: 0.01
@@ -200,5 +200,5 @@ sampler:
   # source_gt_path: '/root/autodl-tmp/CycleDiff/datasets/maps/test/class_Map'
   # target_gt_path: '/root/autodl-tmp/CycleDiff/datasets/maps/test/class_RSI'
 
-  ckpt_path: "/root/autodl-tmp/CycleDiff/results/train_cycle_C_disc_G_blocks_12_maps_rsi2map/model-12.pt"
-  save_folder: "/root/autodl-tmp/CycleDiff/results/sample_results/rsi2map_maps_model_12_timestep100"
+  ckpt_path: "/root/autodl-tmp/CycleDiff/results/maps/train_cycle_C_disc_G_blocks_12_maps_rsi2map/model-12.pt"
+  save_folder: "/root/autodl-tmp/CycleDiff/results/maps/sample_results/rsi2map_maps_model_12_timestep100"
