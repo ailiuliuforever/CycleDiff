@@ -112,6 +112,10 @@ def main(args):
         data_cfg = cfg.data_test
     elif cfg.sampler.task == "cityscape2label":
         data_cfg = cfg.data_test2
+    elif cfg.sampler.task == "rsi2map":
+        data_cfg = cfg.data_test
+    elif cfg.sampler.task == "map2rsi":
+        data_cfg = cfg.data_test2
 
     dataset = construct_class_by_name(**data_cfg)
     dl = DataLoader(dataset, batch_size=cfg.sampler.batch_size, shuffle=False, pin_memory=True,
