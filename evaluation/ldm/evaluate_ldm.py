@@ -184,6 +184,100 @@ def evaluate_reconstruction_from_c(model, dataloader, save_dir, device, num_samp
     return total_samples
 
 
+def visualize_c_components(model, dataloader, save_dir, device, num_samples=4):
+    """可视化 LDM 模型在不同时间步提取的图像分量（C列表）"""
+    from PIL import Image, ImageDraw, ImageFont
+    import numpy as np
+
+    model.eval()
+    vis_dir = os.path.join(save_dir, "c_visualization")
+    os.makedirs(vis_dir, exist_ok=True)
+
+    print("正在可视化 C 分量逐时间步...")
+    print("  采样流程：提取C列表 → 对每个时间步的C分量做min-max归一化 → 拼接可视化")
+
+    with torch.no_grad():
+        for batch_idx, batch in enumerate(dataloader):
+            if batch_idx >= 1:
+                break
+
+            img = batch['image'].to(device)
+            batch_size = min(img.shape[0], num_samples)
+
+            c_list, x_t = model.reverse_q_sample_c_list_concat(img)
+
+            n_timesteps = len(c_list)
+            n_show = min(n_timesteps, 10)
+            step_interval = max(1, n_timesteps // n_show)
+
+            for sample_idx in range(batch_size):
+                rows = []
+                t_indices = []
+                for t_idx in range(0, n_timesteps, step_interval):
+                    c = c_list[t_idx][sample_idx:sample_idx + 1]
+                    c_norm = (c - c.min()) / (c.max() - c.min() + 1e-8)
+                    rows.append(c_norm)
+                    t_indices.append(t_idx)
+
+                if rows:
+                    # 使用 make_grid 生成纵向排列的图像 (nrow=1 表示每行1个，即纵向排列)
+                    grid = tv.utils.make_grid(
+                        torch.cat(rows, dim=0),
+                        nrow=1,
+                        padding=2,
+                        pad_value=1.0
+                    )
+
+                    # 转换为 PIL Image
+                    grid_np = (grid.permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
+                    pil_img = Image.fromarray(grid_np)
+
+                    n_subplots = len(rows)
+                    img_width = pil_img.width
+                    img_height = pil_img.height
+
+                    # make_grid(nrow=1) 的排列方式：
+                    # 图像在垂直方向堆叠，每个子图之间有 padding
+                    # 子图实际高度 = (img_height - padding * (n_subplots + 1)) / n_subplots
+                    padding = 2
+                    subplot_height = (img_height - padding * (n_subplots + 1)) // n_subplots
+                    subplot_width = img_width - padding * 2
+
+                    # 创建带标注的新图像
+                    label_height = 20
+                    new_img_height = img_height + label_height * n_subplots
+                    new_img = Image.new('RGB', (img_width, new_img_height), (255, 255, 255))
+
+                    draw = ImageDraw.Draw(new_img)
+
+                    # 尝试加载字体
+                    try:
+                        font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 12)
+                    except:
+                        font = ImageFont.load_default()
+
+                    # 逐个处理每个子图：先画标注，再贴图像
+                    for i, t_idx in enumerate(t_indices):
+                        # 计算当前子图的位置
+                        label_y_start = i * (subplot_height + padding * 2 + label_height)
+                        img_y_start = label_y_start + label_height
+
+                        # 在原始 grid 中裁剪出当前子图
+                        # make_grid 的排列：从上到下依次是 rows[0], rows[1], ...
+                        src_y_start = padding + i * (subplot_height + padding)
+                        src_y_end = src_y_start + subplot_height
+                        subplot = pil_img.crop((padding, src_y_start, padding + subplot_width, src_y_end))
+
+                        # 在新图像中粘贴标注和子图
+                        draw.text((padding + 5, label_y_start + 2), f"t_idx: {t_idx}", fill=(0, 0, 0), font=font)
+                        new_img.paste(subplot, (padding, img_y_start))
+
+                    new_img.save(os.path.join(vis_dir, f"sample_{sample_idx:03d}_c_components.png"))
+
+            print(f"  ✓ C分量可视化已保存到：{vis_dir}")
+            print(f"    共 {n_timesteps} 个时间步，展示了 {len(rows)} 个时间步的分量")
+
+
 def calculate_reconstruction_metrics(save_dir, num_samples=50):
     """计算重建指标"""
     original_path = os.path.join(save_dir, "original")
@@ -317,6 +411,11 @@ def main(args):
     print("评估：从图像分量（C列表）重建原始图像的能力")
     print("=" * 60)
     num_evaluated = evaluate_reconstruction_from_c(model, dataloader, args.save_dir, device, args.num_samples)
+
+    print("\n" + "=" * 60)
+    print("评估：C 分量逐时间步可视化")
+    print("=" * 60)
+    visualize_c_components(model, dataloader, args.save_dir, device, num_samples=4)
 
     metrics = {}
 
