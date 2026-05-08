@@ -249,7 +249,7 @@ class Sampler(object):
 
                 if "cat2dog" in self.cfg.sampler.task or "wild2dog" in self.cfg.sampler.task or "male2female" in self.cfg.sampler.task or "sem2rgb" in self.cfg.sampler.task or\
                     "depth2rgb" in self.cfg.sampler.task or "edge2rgb" in self.cfg.sampler.task or "summer2winter" in self.cfg.sampler.task or "horse2zebra" in self.cfg.sampler.task or \
-                    "young2old" in self.cfg.sampler.task or "map2satellite" in self.cfg.sampler.task or "label2cityscape" in self.cfg.sampler.task:
+                    "young2old" in self.cfg.sampler.task or "label2cityscape" in self.cfg.sampler.task or "rsi2map" in self.cfg.sampler.task:
                     src_img = batch["image"]
                     x_s = self.get_latent_space(src_img, tag="src_img")
 
