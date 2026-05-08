@@ -174,6 +174,41 @@ def create_comparison_grid(images_list, labels, num_images=4):
     return grid
 
 
+def normalize_c_to_display(c_tensor):
+    c_min = c_tensor.flatten(1).min(dim=1, keepdim=True)[0][:, :, None, None]
+    c_max = c_tensor.flatten(1).max(dim=1, keepdim=True)[0][:, :, None, None]
+    c_norm = (c_tensor - c_min) / (c_max - c_min + 1e-8)
+    return c_norm
+
+
+def create_c_comparison_grid(c_list, num_images=4):
+    comparison = []
+    for i in range(min(num_images, c_list[0].shape[0])):
+        for c_tensor in c_list:
+            c_i = c_tensor[i:i + 1]
+            c_norm = (c_i - c_i.min()) / (c_i.max() - c_i.min() + 1e-8)
+            comparison.append(c_norm.squeeze(0))
+    comparison = torch.stack(comparison, dim=0)
+    grid = tv.utils.make_grid(
+        comparison,
+        nrow=len(c_list),
+        normalize=False,
+        padding=2,
+        pad_value=1.0
+    )
+    return grid
+
+
+def compute_c_diff_map(c_src, c_rec):
+    diff = (c_src - c_rec).abs()
+    diff = diff.mean(dim=1, keepdim=True)
+    diff_min = diff.flatten(1).min(dim=1, keepdim=True)[0][:, :, None, None]
+    diff_max = diff.flatten(1).max(dim=1, keepdim=True)[0][:, :, None, None]
+    diff_norm = (diff - diff_min) / (diff_max - diff_min + 1e-8)
+    diff_rgb = diff_norm.repeat(1, 3, 1, 1)
+    return diff_rgb
+
+
 def evaluate_c_translation(model1, model2, net_G_A, net_G_B, dataloader_a, dataloader_b,
                            save_dir, device, num_samples=50, direction="both"):
     model1.eval()
@@ -314,12 +349,27 @@ def evaluate_cycle_consistency(model1, model2, net_G_A, net_G_B, dataloader_a, d
         os.makedirs(os.path.join(cycle_dir, "forward"), exist_ok=True)
         os.makedirs(os.path.join(cycle_dir, "reconstructed"), exist_ok=True)
         os.makedirs(os.path.join(cycle_dir, "comparison"), exist_ok=True)
+        c_cycle_dir = os.path.join(cycle_dir, "c_space")
+        os.makedirs(os.path.join(c_cycle_dir, "src_c"), exist_ok=True)
+        os.makedirs(os.path.join(c_cycle_dir, "fwd_c"), exist_ok=True)
+        os.makedirs(os.path.join(c_cycle_dir, "rec_c"), exist_ok=True)
+        os.makedirs(os.path.join(c_cycle_dir, "diff_c"), exist_ok=True)
+        os.makedirs(os.path.join(c_cycle_dir, "comparison"), exist_ok=True)
 
         t_steps1 = get_t_steps(model1, device)
         total_samples = 0
         comparison_grids = []
+        c_comparison_grids = []
         cycle_l1_scores = []
         c_cycle_l1_scores = []
+        c_cycle_ssim_scores = []
+        c_cycle_psnr_scores = []
+        c_cycle_lpips_scores = []
+        cycle_ssim_scores = []
+        cycle_psnr_scores = []
+        cycle_lpips_scores = []
+        from taming.modules.losses.lpips import LPIPS as LPIPSModel
+        lpips_fn = LPIPSModel().eval().to(device)
 
         with torch.no_grad():
             for batch_idx, batch in enumerate(dataloader_a):
@@ -344,12 +394,49 @@ def evaluate_cycle_consistency(model1, model2, net_G_A, net_G_B, dataloader_a, d
                 pixel_l1 = F.l1_loss(rec_display, src_display, reduction='none').mean(dim=[1, 2, 3])
                 cycle_l1_scores.extend(pixel_l1.cpu().numpy().tolist())
 
+                from util.mse_psnr_ssim_mssim import ssim as calc_ssim, psnr as calc_psnr
+                ssim_val = calc_ssim(rec_display, src_display, data_range=1, size_average=False)
+                cycle_ssim_scores.extend(ssim_val.cpu().numpy().tolist())
+                psnr_val = calc_psnr(rec_display, src_display, data_range=1.0)
+                cycle_psnr_scores.extend(psnr_val.cpu().numpy().tolist())
+                lpips_val = lpips_fn(rec_display * 2.0 - 1.0, src_display * 2.0 - 1.0)
+                cycle_lpips_scores.extend(lpips_val.flatten().cpu().numpy().tolist())
+
                 src_latent = model1.scale_factor * model1.get_first_stage_encoding(
                     model1.first_stage_model.encode(src_img))
                 rec_latent = model1.scale_factor * model1.get_first_stage_encoding(
                     model1.first_stage_model.encode(rec_img * 2.0 - 1.0))
-                c_l1 = F.l1_loss(-1 * rec_latent, -1 * src_latent, reduction='none').mean(dim=[1, 2, 3])
+                c_src = -1 * src_latent
+                c_rec = -1 * rec_latent
+                c_l1 = F.l1_loss(c_rec, c_src, reduction='none').mean(dim=[1, 2, 3])
                 c_cycle_l1_scores.extend(c_l1.cpu().numpy().tolist())
+
+                from util.mse_psnr_ssim_mssim import ssim as calc_ssim, psnr as calc_psnr
+                c_ssim_val = calc_ssim(c_rec, c_src, data_range=float(c_src.max() - c_src.min()), size_average=False)
+                c_cycle_ssim_scores.extend(c_ssim_val.cpu().numpy().tolist())
+                c_psnr_val = calc_psnr(c_rec, c_src, data_range=float(c_src.max() - c_src.min()))
+                c_cycle_psnr_scores.extend(c_psnr_val.cpu().numpy().tolist())
+
+                with torch.no_grad():
+                    z_src = -c_src / model1.scale_factor
+                    z_rec = -c_rec / model1.scale_factor
+                    decoded_src = model1.first_stage_model.decode(z_src.to(torch.float32))
+                    decoded_rec = model1.first_stage_model.decode(z_rec.to(torch.float32))
+                    decoded_src = (decoded_src + 1.0) * 0.5
+                    decoded_rec = (decoded_rec + 1.0) * 0.5
+                    decoded_src = torch.clamp(decoded_src, 0., 1.)
+                    decoded_rec = torch.clamp(decoded_rec, 0., 1.)
+                c_lpips_val = lpips_fn(decoded_rec * 2.0 - 1.0, decoded_src * 2.0 - 1.0)
+                c_cycle_lpips_scores.extend(c_lpips_val.flatten().cpu().numpy().tolist())
+
+                fwd_latent = model2.scale_factor * model2.get_first_stage_encoding(
+                    model2.first_stage_model.encode(fwd_img * 2.0 - 1.0))
+                c_fwd = -1 * fwd_latent
+
+                c_src_display = normalize_c_to_display(c_src)
+                c_fwd_display = normalize_c_to_display(c_fwd)
+                c_rec_display = normalize_c_to_display(c_rec)
+                c_diff_display = compute_c_diff_map(c_src, c_rec)
 
                 for i in range(min(batch_size, num_samples - total_samples)):
                     tv.utils.save_image(src_display[i:i + 1],
@@ -358,6 +445,14 @@ def evaluate_cycle_consistency(model1, model2, net_G_A, net_G_B, dataloader_a, d
                                         os.path.join(cycle_dir, "forward", f"sample_{total_samples + i:03d}.png"))
                     tv.utils.save_image(rec_display[i:i + 1],
                                         os.path.join(cycle_dir, "reconstructed", f"sample_{total_samples + i:03d}.png"))
+                    tv.utils.save_image(c_src_display[i:i + 1],
+                                        os.path.join(c_cycle_dir, "src_c", f"sample_{total_samples + i:03d}.png"))
+                    tv.utils.save_image(c_fwd_display[i:i + 1],
+                                        os.path.join(c_cycle_dir, "fwd_c", f"sample_{total_samples + i:03d}.png"))
+                    tv.utils.save_image(c_rec_display[i:i + 1],
+                                        os.path.join(c_cycle_dir, "rec_c", f"sample_{total_samples + i:03d}.png"))
+                    tv.utils.save_image(c_diff_display[i:i + 1],
+                                        os.path.join(c_cycle_dir, "diff_c", f"sample_{total_samples + i:03d}.png"))
 
                 n_compare = min(batch_size, 4)
                 grid = create_comparison_grid(
@@ -366,6 +461,13 @@ def evaluate_cycle_consistency(model1, model2, net_G_A, net_G_B, dataloader_a, d
                     num_images=n_compare
                 )
                 comparison_grids.append(grid)
+
+                c_grid = create_c_comparison_grid(
+                    [c_src_display[:n_compare], c_fwd_display[:n_compare],
+                     c_rec_display[:n_compare], c_diff_display[:n_compare]],
+                    num_images=n_compare
+                )
+                c_comparison_grids.append(c_grid)
 
                 total_samples += batch_size
                 if batch_idx % 5 == 0:
@@ -377,15 +479,37 @@ def evaluate_cycle_consistency(model1, model2, net_G_A, net_G_B, dataloader_a, d
             all_grids = torch.cat(comparison_grids[:5], dim=1)
             tv.utils.save_image(all_grids, os.path.join(cycle_dir, "comparison", "all_comparison.png"))
 
+        for idx, grid in enumerate(c_comparison_grids[:10]):
+            tv.utils.save_image(grid, os.path.join(c_cycle_dir, "comparison", f"c_comparison_batch_{idx:03d}.png"))
+        if c_comparison_grids:
+            all_c_grids = torch.cat(c_comparison_grids[:5], dim=1)
+            tv.utils.save_image(all_c_grids, os.path.join(c_cycle_dir, "comparison", "all_c_comparison.png"))
+
         results['ABA'] = {
             'pixel_l1_mean': float(np.mean(cycle_l1_scores)),
             'pixel_l1_std': float(np.std(cycle_l1_scores)),
             'c_l1_mean': float(np.mean(c_cycle_l1_scores)),
             'c_l1_std': float(np.std(c_cycle_l1_scores)),
+            'c_ssim_mean': float(np.mean(c_cycle_ssim_scores)),
+            'c_ssim_std': float(np.std(c_cycle_ssim_scores)),
+            'c_psnr_mean': float(np.mean(c_cycle_psnr_scores)),
+            'c_psnr_std': float(np.std(c_cycle_psnr_scores)),
+            'c_lpips_mean': float(np.mean(c_cycle_lpips_scores)),
+            'c_lpips_std': float(np.std(c_cycle_lpips_scores)),
+            'ssim_mean': float(np.mean(cycle_ssim_scores)),
+            'ssim_std': float(np.std(cycle_ssim_scores)),
+            'psnr_mean': float(np.mean(cycle_psnr_scores)),
+            'psnr_std': float(np.std(cycle_psnr_scores)),
+            'lpips_mean': float(np.mean(cycle_lpips_scores)),
+            'lpips_std': float(np.std(cycle_lpips_scores)),
             'original_path': os.path.join(cycle_dir, "original"),
             'reconstructed_path': os.path.join(cycle_dir, "reconstructed"),
+            'c_space_path': c_cycle_dir,
         }
         print(f"✓ A→B→A 循环一致性 - 像素L1: {results['ABA']['pixel_l1_mean']:.6f}, C空间L1: {results['ABA']['c_l1_mean']:.6f}")
+        print(f"  像素域 SSIM: {results['ABA']['ssim_mean']:.4f}, PSNR: {results['ABA']['psnr_mean']:.2f} dB, LPIPS: {results['ABA']['lpips_mean']:.4f}")
+        print(f"  C空间 SSIM: {results['ABA']['c_ssim_mean']:.4f}, PSNR: {results['ABA']['c_psnr_mean']:.2f} dB, LPIPS: {results['ABA']['c_lpips_mean']:.4f}")
+        print(f"  C空间可视化已保存到：{c_cycle_dir}")
 
     if direction in ["B2A", "both"]:
         print("\n" + "=" * 60)
@@ -396,12 +520,27 @@ def evaluate_cycle_consistency(model1, model2, net_G_A, net_G_B, dataloader_a, d
         os.makedirs(os.path.join(cycle_dir, "forward"), exist_ok=True)
         os.makedirs(os.path.join(cycle_dir, "reconstructed"), exist_ok=True)
         os.makedirs(os.path.join(cycle_dir, "comparison"), exist_ok=True)
+        c_cycle_dir = os.path.join(cycle_dir, "c_space")
+        os.makedirs(os.path.join(c_cycle_dir, "src_c"), exist_ok=True)
+        os.makedirs(os.path.join(c_cycle_dir, "fwd_c"), exist_ok=True)
+        os.makedirs(os.path.join(c_cycle_dir, "rec_c"), exist_ok=True)
+        os.makedirs(os.path.join(c_cycle_dir, "diff_c"), exist_ok=True)
+        os.makedirs(os.path.join(c_cycle_dir, "comparison"), exist_ok=True)
 
         t_steps2 = get_t_steps(model2, device)
         total_samples = 0
         comparison_grids = []
+        c_comparison_grids = []
         cycle_l1_scores = []
         c_cycle_l1_scores = []
+        c_cycle_ssim_scores = []
+        c_cycle_psnr_scores = []
+        c_cycle_lpips_scores = []
+        cycle_ssim_scores = []
+        cycle_psnr_scores = []
+        cycle_lpips_scores = []
+        from taming.modules.losses.lpips import LPIPS as LPIPSModel
+        lpips_fn = LPIPSModel().eval().to(device)
 
         with torch.no_grad():
             for batch_idx, batch in enumerate(dataloader_b):
@@ -426,12 +565,49 @@ def evaluate_cycle_consistency(model1, model2, net_G_A, net_G_B, dataloader_a, d
                 pixel_l1 = F.l1_loss(rec_display, src_display, reduction='none').mean(dim=[1, 2, 3])
                 cycle_l1_scores.extend(pixel_l1.cpu().numpy().tolist())
 
+                from util.mse_psnr_ssim_mssim import ssim as calc_ssim, psnr as calc_psnr
+                ssim_val = calc_ssim(rec_display, src_display, data_range=1, size_average=False)
+                cycle_ssim_scores.extend(ssim_val.cpu().numpy().tolist())
+                psnr_val = calc_psnr(rec_display, src_display, data_range=1.0)
+                cycle_psnr_scores.extend(psnr_val.cpu().numpy().tolist())
+                lpips_val = lpips_fn(rec_display * 2.0 - 1.0, src_display * 2.0 - 1.0)
+                cycle_lpips_scores.extend(lpips_val.flatten().cpu().numpy().tolist())
+
                 src_latent = model2.scale_factor * model2.get_first_stage_encoding(
                     model2.first_stage_model.encode(src_img))
                 rec_latent = model2.scale_factor * model2.get_first_stage_encoding(
                     model2.first_stage_model.encode(rec_img * 2.0 - 1.0))
-                c_l1 = F.l1_loss(-1 * rec_latent, -1 * src_latent, reduction='none').mean(dim=[1, 2, 3])
+                c_src = -1 * src_latent
+                c_rec = -1 * rec_latent
+                c_l1 = F.l1_loss(c_rec, c_src, reduction='none').mean(dim=[1, 2, 3])
                 c_cycle_l1_scores.extend(c_l1.cpu().numpy().tolist())
+
+                from util.mse_psnr_ssim_mssim import ssim as calc_ssim, psnr as calc_psnr
+                c_ssim_val = calc_ssim(c_rec, c_src, data_range=float(c_src.max() - c_src.min()), size_average=False)
+                c_cycle_ssim_scores.extend(c_ssim_val.cpu().numpy().tolist())
+                c_psnr_val = calc_psnr(c_rec, c_src, data_range=float(c_src.max() - c_src.min()))
+                c_cycle_psnr_scores.extend(c_psnr_val.cpu().numpy().tolist())
+
+                with torch.no_grad():
+                    z_src = -c_src / model2.scale_factor
+                    z_rec = -c_rec / model2.scale_factor
+                    decoded_src = model2.first_stage_model.decode(z_src.to(torch.float32))
+                    decoded_rec = model2.first_stage_model.decode(z_rec.to(torch.float32))
+                    decoded_src = (decoded_src + 1.0) * 0.5
+                    decoded_rec = (decoded_rec + 1.0) * 0.5
+                    decoded_src = torch.clamp(decoded_src, 0., 1.)
+                    decoded_rec = torch.clamp(decoded_rec, 0., 1.)
+                c_lpips_val = lpips_fn(decoded_rec * 2.0 - 1.0, decoded_src * 2.0 - 1.0)
+                c_cycle_lpips_scores.extend(c_lpips_val.flatten().cpu().numpy().tolist())
+
+                fwd_latent = model1.scale_factor * model1.get_first_stage_encoding(
+                    model1.first_stage_model.encode(fwd_img * 2.0 - 1.0))
+                c_fwd = -1 * fwd_latent
+
+                c_src_display = normalize_c_to_display(c_src)
+                c_fwd_display = normalize_c_to_display(c_fwd)
+                c_rec_display = normalize_c_to_display(c_rec)
+                c_diff_display = compute_c_diff_map(c_src, c_rec)
 
                 for i in range(min(batch_size, num_samples - total_samples)):
                     tv.utils.save_image(src_display[i:i + 1],
@@ -440,6 +616,14 @@ def evaluate_cycle_consistency(model1, model2, net_G_A, net_G_B, dataloader_a, d
                                         os.path.join(cycle_dir, "forward", f"sample_{total_samples + i:03d}.png"))
                     tv.utils.save_image(rec_display[i:i + 1],
                                         os.path.join(cycle_dir, "reconstructed", f"sample_{total_samples + i:03d}.png"))
+                    tv.utils.save_image(c_src_display[i:i + 1],
+                                        os.path.join(c_cycle_dir, "src_c", f"sample_{total_samples + i:03d}.png"))
+                    tv.utils.save_image(c_fwd_display[i:i + 1],
+                                        os.path.join(c_cycle_dir, "fwd_c", f"sample_{total_samples + i:03d}.png"))
+                    tv.utils.save_image(c_rec_display[i:i + 1],
+                                        os.path.join(c_cycle_dir, "rec_c", f"sample_{total_samples + i:03d}.png"))
+                    tv.utils.save_image(c_diff_display[i:i + 1],
+                                        os.path.join(c_cycle_dir, "diff_c", f"sample_{total_samples + i:03d}.png"))
 
                 n_compare = min(batch_size, 4)
                 grid = create_comparison_grid(
@@ -448,6 +632,13 @@ def evaluate_cycle_consistency(model1, model2, net_G_A, net_G_B, dataloader_a, d
                     num_images=n_compare
                 )
                 comparison_grids.append(grid)
+
+                c_grid = create_c_comparison_grid(
+                    [c_src_display[:n_compare], c_fwd_display[:n_compare],
+                     c_rec_display[:n_compare], c_diff_display[:n_compare]],
+                    num_images=n_compare
+                )
+                c_comparison_grids.append(c_grid)
 
                 total_samples += batch_size
                 if batch_idx % 5 == 0:
@@ -459,15 +650,37 @@ def evaluate_cycle_consistency(model1, model2, net_G_A, net_G_B, dataloader_a, d
             all_grids = torch.cat(comparison_grids[:5], dim=1)
             tv.utils.save_image(all_grids, os.path.join(cycle_dir, "comparison", "all_comparison.png"))
 
+        for idx, grid in enumerate(c_comparison_grids[:10]):
+            tv.utils.save_image(grid, os.path.join(c_cycle_dir, "comparison", f"c_comparison_batch_{idx:03d}.png"))
+        if c_comparison_grids:
+            all_c_grids = torch.cat(c_comparison_grids[:5], dim=1)
+            tv.utils.save_image(all_c_grids, os.path.join(c_cycle_dir, "comparison", "all_c_comparison.png"))
+
         results['BAB'] = {
             'pixel_l1_mean': float(np.mean(cycle_l1_scores)),
             'pixel_l1_std': float(np.std(cycle_l1_scores)),
             'c_l1_mean': float(np.mean(c_cycle_l1_scores)),
             'c_l1_std': float(np.std(c_cycle_l1_scores)),
+            'c_ssim_mean': float(np.mean(c_cycle_ssim_scores)),
+            'c_ssim_std': float(np.std(c_cycle_ssim_scores)),
+            'c_psnr_mean': float(np.mean(c_cycle_psnr_scores)),
+            'c_psnr_std': float(np.std(c_cycle_psnr_scores)),
+            'c_lpips_mean': float(np.mean(c_cycle_lpips_scores)),
+            'c_lpips_std': float(np.std(c_cycle_lpips_scores)),
+            'ssim_mean': float(np.mean(cycle_ssim_scores)),
+            'ssim_std': float(np.std(cycle_ssim_scores)),
+            'psnr_mean': float(np.mean(cycle_psnr_scores)),
+            'psnr_std': float(np.std(cycle_psnr_scores)),
+            'lpips_mean': float(np.mean(cycle_lpips_scores)),
+            'lpips_std': float(np.std(cycle_lpips_scores)),
             'original_path': os.path.join(cycle_dir, "original"),
             'reconstructed_path': os.path.join(cycle_dir, "reconstructed"),
+            'c_space_path': c_cycle_dir,
         }
         print(f"✓ B→A→B 循环一致性 - 像素L1: {results['BAB']['pixel_l1_mean']:.6f}, C空间L1: {results['BAB']['c_l1_mean']:.6f}")
+        print(f"  像素域 SSIM: {results['BAB']['ssim_mean']:.4f}, PSNR: {results['BAB']['psnr_mean']:.2f} dB, LPIPS: {results['BAB']['lpips_mean']:.4f}")
+        print(f"  C空间 SSIM: {results['BAB']['c_ssim_mean']:.4f}, PSNR: {results['BAB']['c_psnr_mean']:.2f} dB, LPIPS: {results['BAB']['c_lpips_mean']:.4f}")
+        print(f"  C空间可视化已保存到：{c_cycle_dir}")
 
     return results
 
@@ -1000,8 +1213,16 @@ def main(args):
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
-    print(f"\n2. 加载 CycleDiff 模型：{args.ckpt}")
-    model1, model2, net_G_A, net_G_B = load_cyclediff_model(cfg, args.ckpt, device, args.use_ema)
+    # 优先从配置文件的 sampler.ckpt_path 读取模型路径
+    ckpt_path = cfg.get('sampler', {}).get('ckpt_path', args.ckpt)
+    if ckpt_path and ckpt_path != args.ckpt:
+        print(f"   从配置文件 sampler.ckpt_path 读取模型路径: {ckpt_path}")
+    else:
+        ckpt_path = args.ckpt
+        print(f"   使用命令行参数指定的模型路径: {ckpt_path}")
+
+    print(f"\n2. 加载 CycleDiff 模型：{ckpt_path}")
+    model1, model2, net_G_A, net_G_B = load_cyclediff_model(cfg, ckpt_path, device, args.use_ema)
 
     print(f"\n3. 加载数据集")
     data_test_cfg_a = cfg.get('data_test', {})
@@ -1116,13 +1337,110 @@ def main(args):
                 cycle_info = all_metrics['cycle'][key]
                 pixel_l1 = cycle_info.get('pixel_l1_mean', float('inf'))
                 c_l1 = cycle_info.get('c_l1_mean', float('inf'))
-                if pixel_l1 < 0.1:
-                    print(f"✓ 循环一致性 {key}：优秀 (像素L1 = {pixel_l1:.6f})")
-                elif pixel_l1 < 0.2:
-                    print(f"✓ 循环一致性 {key}：良好 (像素L1 = {pixel_l1:.6f})")
+                ssim_val = cycle_info.get('ssim_mean', 0)
+                psnr_val = cycle_info.get('psnr_mean', 0)
+                lpips_val = cycle_info.get('lpips_mean', 1)
+                c_ssim_val = cycle_info.get('c_ssim_mean', 0)
+                c_psnr_val = cycle_info.get('c_psnr_mean', 0)
+                c_lpips_val = cycle_info.get('c_lpips_mean', 1)
+
+                if pixel_l1 < 0.05:
+                    l1_grade = "优秀"
+                elif pixel_l1 < 0.10:
+                    l1_grade = "良好"
+                elif pixel_l1 < 0.15:
+                    l1_grade = "一般"
                 else:
-                    print(f"⚠ 循环一致性 {key}：需改进 (像素L1 = {pixel_l1:.6f})")
-                print(f"  C空间L1: {c_l1:.6f}")
+                    l1_grade = "需改进"
+
+                if ssim_val > 0.90:
+                    ssim_grade = "优秀"
+                elif ssim_val > 0.75:
+                    ssim_grade = "良好"
+                elif ssim_val > 0.60:
+                    ssim_grade = "一般"
+                else:
+                    ssim_grade = "需改进"
+
+                if psnr_val > 30:
+                    psnr_grade = "优秀"
+                elif psnr_val > 25:
+                    psnr_grade = "良好"
+                elif psnr_val > 20:
+                    psnr_grade = "一般"
+                else:
+                    psnr_grade = "需改进"
+
+                if lpips_val < 0.10:
+                    lpips_grade = "优秀"
+                elif lpips_val < 0.20:
+                    lpips_grade = "良好"
+                elif lpips_val < 0.35:
+                    lpips_grade = "一般"
+                else:
+                    lpips_grade = "需改进"
+
+                if c_l1 < 0.05:
+                    c_l1_grade = "优秀"
+                elif c_l1 < 0.10:
+                    c_l1_grade = "良好"
+                elif c_l1 < 0.20:
+                    c_l1_grade = "一般"
+                else:
+                    c_l1_grade = "需改进"
+
+                if c_ssim_val > 0.90:
+                    c_ssim_grade = "优秀"
+                elif c_ssim_val > 0.75:
+                    c_ssim_grade = "良好"
+                elif c_ssim_val > 0.60:
+                    c_ssim_grade = "一般"
+                else:
+                    c_ssim_grade = "需改进"
+
+                if c_psnr_val > 30:
+                    c_psnr_grade = "优秀"
+                elif c_psnr_val > 25:
+                    c_psnr_grade = "良好"
+                elif c_psnr_val > 20:
+                    c_psnr_grade = "一般"
+                else:
+                    c_psnr_grade = "需改进"
+
+                if c_lpips_val < 0.10:
+                    c_lpips_grade = "优秀"
+                elif c_lpips_val < 0.20:
+                    c_lpips_grade = "良好"
+                elif c_lpips_val < 0.35:
+                    c_lpips_grade = "一般"
+                else:
+                    c_lpips_grade = "需改进"
+
+                grades = {"优秀": 4, "良好": 3, "一般": 2, "需改进": 1}
+                pixel_grade_num = min(
+                    grades[l1_grade], grades[ssim_grade],
+                    grades[psnr_grade], grades[lpips_grade]
+                )
+                pixel_grade = {v: k for k, v in grades.items()}[pixel_grade_num]
+                c_grade_num = min(
+                    grades[c_l1_grade], grades[c_ssim_grade],
+                    grades[c_psnr_grade], grades[c_lpips_grade]
+                )
+                c_grade = {v: k for k, v in grades.items()}[c_grade_num]
+                overall_grade_num = min(pixel_grade_num, c_grade_num)
+                overall_grade = {v: k for k, v in grades.items()}[overall_grade_num]
+
+                print(f"循环一致性 {key} 综合评级：{overall_grade}")
+                print(f"  ── 像素域 ──")
+                print(f"  L1:   {pixel_l1:.6f} [{l1_grade}]")
+                print(f"  SSIM: {ssim_val:.4f} [{ssim_grade}]")
+                print(f"  PSNR: {psnr_val:.2f} dB [{psnr_grade}]")
+                print(f"  LPIPS:{lpips_val:.4f} [{lpips_grade}]")
+                print(f"  ── C空间 ──")
+                print(f"  L1:   {c_l1:.6f} [{c_l1_grade}]")
+                print(f"  SSIM: {c_ssim_val:.4f} [{c_ssim_grade}]")
+                print(f"  PSNR: {c_psnr_val:.2f} dB [{c_psnr_grade}]")
+                print(f"  LPIPS:{c_lpips_val:.4f} [{c_lpips_grade}]")
 
     if 'identity' in all_metrics:
         for key in ['identity_A', 'identity_B']:
