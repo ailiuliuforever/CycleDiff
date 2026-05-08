@@ -20,22 +20,45 @@ import swanlab
 from datetime import datetime
 
 def parse_args():
+    """
+    解析命令行参数
+    
+    Returns:
+        args: 包含配置文件的解析后的参数对象
+    """
     parser = argparse.ArgumentParser(description="training vae configure")
     parser.add_argument("--cfg", help="experiment configure file name", type=str, required=True)
     args = parser.parse_args()
     args.cfg = load_conf(args.cfg)
     return args
-
-
+    
 def load_conf(config_file, conf={}):
+    """
+    加载YAML配置文件
+    
+    Args:
+        config_file: 配置文件路径
+        conf: 配置字典，用于存储加载的配置
+        
+    Returns:
+        conf: 包含所有配置项的字典
+    """
     with open(config_file) as f:
         exp_conf = yaml.load(f, Loader=yaml.FullLoader)
         for k, v in exp_conf.items():
             conf[k] = v
     return conf
 
-
 def cfgnode_to_dict(cfg_node):
+    """
+    将CfgNode对象递归转换为普通字典
+    
+    Args:
+        cfg_node: CfgNode对象或嵌套字典
+        
+    Returns:
+        dict: 转换后的普通字典
+    """
     if isinstance(cfg_node, CfgNode):
         return {k: cfgnode_to_dict(v) for k, v in cfg_node.items()}
     elif isinstance(cfg_node, dict):
@@ -43,8 +66,20 @@ def cfgnode_to_dict(cfg_node):
     else:
         return cfg_node
 
-
 def main(args):
+    """
+    主训练函数：初始化模型、数据集和训练器，执行训练流程
+    
+    主要功能：
+    1. 构建两个扩散模型（model1和model2）及其VAE编码器
+    2. 构建生成器网络（net_G_A, net_G_B）和判别器网络（net_D_A, net_D_B）
+    3. 创建训练和测试数据加载器
+    4. 初始化Trainer并执行训练
+    5. 可选：在训练前进行测试采样
+    
+    Args:
+        args: 包含配置信息的参数对象
+    """
     cfg = CfgNode(args.cfg)
 
     model_cfg1 = cfg.model1
@@ -83,6 +118,14 @@ def main(args):
     dataset = construct_class_by_name(**data_cfg)
     dl = DataLoader(dataset, batch_size=data_cfg.batch_size, shuffle=True, pin_memory=True,
                     num_workers=data_cfg.get('num_workers', 2))
+    
+    # Create fixed test dataset for consistent sampling
+    test_data_cfg = cfg.data.copy()
+    test_data_cfg['split'] = 'test'  # Use test split
+    test_dataset = construct_class_by_name(**test_data_cfg)
+    test_dl = DataLoader(test_dataset, batch_size=data_cfg.batch_size, shuffle=False, pin_memory=True,
+                         num_workers=data_cfg.get('num_workers', 2))
+    
     train_cfg = cfg.trainer
     trainer = Trainer(
         ldm1, ldm2, net_G_A, net_G_B, net_D_A, net_D_B, dl, train_batch_size=data_cfg.batch_size,
@@ -92,6 +135,7 @@ def main(args):
         amp=train_cfg.amp, fp16=train_cfg.fp16, log_freq=train_cfg.log_freq, cfg=cfg,
         resume_milestone=train_cfg.resume_milestone,
         train_wd=train_cfg.get('weight_decay', 1e-2),
+        test_data_loader=test_dl,
     )
     if train_cfg.test_before:
         if trainer.accelerator.is_main_process:
@@ -133,7 +177,6 @@ def main(args):
     trainer.train()
     pass
 
-
 class Trainer(object):
     def __init__(
             self,
@@ -160,7 +203,37 @@ class Trainer(object):
             log_freq=20,
             resume_milestone=0,
             cfg={},
+            test_data_loader=None,
     ):
+        """
+        初始化训练器
+        
+        Args:
+            model1: 源域扩散模型
+            model2: 目标域扩散模型
+            net_G_A: 从源域到目标域的生成器
+            net_G_B: 从目标域到源域的生成器
+            net_D_A: 目标域（B域）判别器，用于判断B域特征的真假
+            net_D_B: 源域（A域）判别器，用于判断A域特征的真假
+            data_loader: 训练数据加载器
+            train_batch_size: 训练批次大小
+            gradient_accumulate_every: 梯度累积步数
+            train_lr: 扩散模型学习率
+            trans_net_lr: 转换网络（生成器和判别器）学习率
+            train_wd: 权重衰减系数
+            train_num_steps: 总训练步数
+            save_every: 保存模型的间隔步数
+            sample_every: 采样图像的间隔步数
+            num_samples: 采样图像数量
+            results_folder: 结果保存文件夹路径
+            amp: 是否使用自动混合精度
+            fp16: 是否使用FP16精度
+            split_batches: 是否分割批次
+            log_freq: 日志记录频率
+            resume_milestone: 恢复训练的里程碑编号
+            cfg: 完整配置对象
+            test_data_loader: 测试数据加载器（用于固定采样）
+        """
         super().__init__()
         ddp_handler = DistributedDataParallelKwargs(find_unused_parameters=True)
         self.accelerator = Accelerator(
@@ -194,6 +267,12 @@ class Trainer(object):
         # dataset and dataloader
         dl = self.accelerator.prepare(data_loader)
         self.dl = cycle(dl)
+        
+        # Fixed test data loader for consistent sampling
+        if test_data_loader is not None:
+            self.test_dl = cycle(self.accelerator.prepare(test_data_loader))
+        else:
+            self.test_dl = None
 
         # optimizer
         self.opt_d1 = torch.optim.AdamW(filter(lambda p: p.requires_grad, model1.parameters()),
@@ -261,6 +340,15 @@ class Trainer(object):
             self.init_from_ckpt2(cfg.trainer.ckpt_path2)
 
     def init_from_ckpt1(self, path):
+        """
+        从检查点文件初始化model1的权重
+        
+        Args:
+            path: 检查点文件路径
+            
+        Note:
+            如果配置中启用了ft_use_ema，则使用EMA模型的权重
+        """
         data = safe_torch_load(path,
                           map_location=lambda storage, loc: storage)
         if self.cfg.trainer.ft_use_ema:
@@ -279,6 +367,15 @@ class Trainer(object):
             self.model1.scale_factor = data['model']['scale_factor']
 
     def init_from_ckpt2(self, path):
+        """
+        从检查点文件初始化model2的权重
+        
+        Args:
+            path: 检查点文件路径
+            
+        Note:
+            如果配置中启用了ft_use_ema，则使用EMA模型的权重
+        """
         data = safe_torch_load(path,
                           map_location=lambda storage, loc: storage)
         if self.cfg.trainer.ft_use_ema:
@@ -297,6 +394,20 @@ class Trainer(object):
             self.model2.scale_factor = data['model']['scale_factor']
 
     def save(self, milestone):
+        """
+        保存模型检查点到磁盘
+        
+        保存内容包括：
+        - 当前训练步数
+        - 所有模型的状态字典（model1, model2, net_G_A/B, net_D_A/B）
+        - 所有优化器的状态
+        - 学习率调度器状态
+        - EMA模型状态
+        - 梯度缩放器状态（如果使用AMP）
+        
+        Args:
+            milestone: 里程碑编号，用于命名保存的文件
+        """
         if not self.accelerator.is_local_main_process:
             return
 
@@ -324,6 +435,19 @@ class Trainer(object):
         torch.save(data, str(self.results_folder / f'model-{milestone}.pt'))
 
     def load(self, milestone):
+        """
+        从磁盘加载模型检查点
+        
+        恢复内容包括：
+        - 所有模型的权重
+        - 优化器状态
+        - 学习率调度器状态
+        - EMA模型状态
+        - 训练步数
+        
+        Args:
+            milestone: 要加载的里程碑编号
+        """
         accelerator = self.accelerator
 
         data = safe_torch_load(str(self.results_folder / f'model-{milestone}.pt'),
@@ -362,6 +486,21 @@ class Trainer(object):
             self.accelerator.scaler.load_state_dict(data['scaler'])
 
     def mcl_fake(self, out1, out2, temperature, distributed=False):
+        """
+        计算互对比学习（Mutual Contrastive Learning）损失
+        
+        通过最大化正样本对的相似度、最小化负样本对的相似度来学习特征表示。
+        使用softmax交叉熵损失来实现对比学习目标。
+        
+        Args:
+            out1: 第一个输出特征向量
+            out2: 第二个输出特征向量
+            temperature: 温度参数，控制分布的平滑程度
+            distributed: 是否在分布式环境下运行
+            
+        Returns:
+            d_loss: 对比学习损失值
+        """
         if distributed:
             out1 = torch.cat(GatherLayer.apply(out1), dim=0)
             out2 = torch.cat(GatherLayer.apply(out2), dim=0)
@@ -387,6 +526,18 @@ class Trainer(object):
         return d_loss
 
     def get_latent_space(self, x, tag=None):
+        """
+        将图像编码到潜空间（latent space）
+        
+        使用VAE编码器将输入图像转换为潜变量，并应用缩放因子。
+        
+        Args:
+            x: 输入图像张量
+            tag: 标签，用于判断使用哪个模型的编码器（"src"或"trg"）
+            
+        Returns:
+            z: 缩放后的潜变量
+        """
         if "src" in tag:
             z = self.model1.first_stage_model.encode(x)
             z = self.model1.get_first_stage_encoding(z)
@@ -398,6 +549,13 @@ class Trainer(object):
         return z
 
     def set_requires_grad(self, nets, requires_grad=False):
+        """
+        设置网络参数的梯度计算开关
+        
+        Args:
+            nets: 单个网络或网络列表
+            requires_grad: 是否启用梯度计算，默认为False
+        """
         if not isinstance(nets, list):
             nets = [nets]
         for net in nets:
@@ -406,6 +564,32 @@ class Trainer(object):
                     param.requires_grad = requires_grad
 
     def cycle_train_C_disc(self, batch, ga_ind):
+        """
+        执行循环一致性训练的核心函数
+        
+        根据ga_ind的不同值，分别计算生成器损失或判别器损失：
+        
+        ga_ind == 0: 计算生成器相关损失
+            - LDM重构损失（潜空间条件预测）
+            - 身份映射损失（保持输入不变）
+            - 循环一致性损失（A->B->A和B->A->B）
+            - 对抗损失（生成器欺骗判别器）
+            - 感知损失（LPIPS）
+        
+        ga_ind == 1: 计算判别器相关损失
+            - 判别器真假分类损失
+            - 互对比学习损失（MCL）
+            - LDM重构损失
+        
+        Args:
+            batch: 包含源图像和目标图像的数据批次
+            ga_ind: 梯度累积索引，0表示生成器阶段，1表示判别器阶段
+            
+        Returns:
+            loss_total: 总损失（生成器损失或判别器损失）
+            loss_ddm: LDM扩散模型损失
+            loss_dict: 包含各项损失的字典
+        """
         split = "train"
         if ga_ind == 0:
             x_s = batch["src_img"]
@@ -438,12 +622,12 @@ class Trainer(object):
                 idt_C_T = self.net_G_A(input_C_T, t)
 
                 loss_ldm = self.cfg.trainer.ft_weight * (F.mse_loss(pred_C_S, C_S) + F.mse_loss(pred_C_T, C_T) + F.mse_loss(pred_noise_C_S, noise) + F.mse_loss(pred_noise_C_T, noise2))
-                loss_idt = F.l1_loss(idt_C_S, input_C_S) * self.cfg.trainer.idt_weight * self.cfg.trainer.cycle_weight + F.l1_loss(idt_C_T, input_C_T) * self.cfg.trainer.idt_weight * self.cfg.trainer.cycle_weight
-                loss_cycle_ABA = F.l1_loss(recon_C_S, input_C_S) * self.cfg.trainer.cycle_weight
-                loss_cycle_BAB = F.l1_loss(recon_C_T, input_C_T) * self.cfg.trainer.cycle_weight
+                loss_idt = F.l1_loss(idt_C_S, input_C_S) * self.cfg.trainer.idt_weight * self.cfg.trainer.get('cycle_ABA_weight', self.cfg.trainer.cycle_weight) + F.l1_loss(idt_C_T, input_C_T) * self.cfg.trainer.idt_weight * self.cfg.trainer.get('cycle_BAB_weight', self.cfg.trainer.cycle_weight)
+                loss_cycle_ABA = F.l1_loss(recon_C_S, input_C_S) * self.cfg.trainer.get('cycle_ABA_weight', self.cfg.trainer.cycle_weight)
+                loss_cycle_BAB = F.l1_loss(recon_C_T, input_C_T) * self.cfg.trainer.get('cycle_BAB_weight', self.cfg.trainer.cycle_weight)
 
-                loss_G_adv_A = self.criterionGAN(self.net_D_A(fake_C_T), True)
-                loss_G_adv_B = self.criterionGAN(self.net_D_B(fake_C_S), True)
+                loss_G_adv_A = self.criterionGAN(self.net_D_A(fake_C_T), True) * self.cfg.trainer.get('g_adv_A_weight', 1.0)
+                loss_G_adv_B = self.criterionGAN(self.net_D_B(fake_C_S), True) * self.cfg.trainer.get('g_adv_B_weight', 1.0)
 
                 loss_perceptual = (self.perceptual_loss(input_C_S, recon_C_S).mean([1, 2, 3]) + self.perceptual_loss(input_C_T, recon_C_T).mean([1, 2, 3])).mean() * self.cfg.trainer.perceptual_weight
 
@@ -505,8 +689,8 @@ class Trainer(object):
             mcl_fake_C_T = F.normalize(pred_fake_C_T.view(-1, pred_fake_C_S.shape[-1]))
             mcl_real_C_T = F.normalize(pred_real_x_t.view(-1, pred_fake_C_S.shape[-1]))
             loss_mcl_A = self.mcl_fake(mcl_fake_C_T, mcl_real_C_T, temperature=self.cfg.trainer.temp) * self.cfg.trainer.mcl_weight
-            loss_D_A = (loss_D_A_fake + loss_D_A_real) * 0.5
-            loss_D_B = (loss_D_B_fake + loss_D_B_real) * 0.5
+            loss_D_A = (loss_D_A_fake + loss_D_A_real) * 0.5 * self.cfg.trainer.get('d_A_weight', 1.0)
+            loss_D_B = (loss_D_B_fake + loss_D_B_real) * 0.5 * self.cfg.trainer.get('d_B_weight', 1.0)
 
             loss_ldm = self.cfg.trainer.ft_weight * (F.mse_loss(pred_C_S, C_S) + F.mse_loss(pred_C_T, C_T) + F.mse_loss(pred_noise_C_S, noise) + F.mse_loss(pred_noise_C_T, noise2))
             loss_dis_total = loss_D_A + loss_D_B + loss_mcl_A + loss_mcl_B
@@ -520,11 +704,29 @@ class Trainer(object):
                    "{}/loss_ldm_D".format(split): loss_ldm.detach(),
                    "{}/loss_dis_total".format(split): loss_dis_total.detach(),
                    }
-
             return loss_dis_total, loss_ldm, loss_dict
 
-
     def train(self):
+        """
+        主训练循环
+        
+        训练流程：
+        1. 遍历训练数据批次
+        2. 对于每个批次，执行两次梯度累积：
+           - 第一次（ga_ind=0）：更新生成器和扩散模型
+           - 第二次（ga_ind=1）：更新判别器和扩散模型
+        3. 梯度裁剪以防止梯度爆炸
+        4. 更新学习率调度器
+        5. 记录损失到TensorBoard和SwanLab
+        6. 定期保存模型检查点
+        7. 定期进行图像采样和可视化
+        
+        采样过程：
+        - 使用固定的测试数据进行一致的可视化对比
+        - 执行双向翻译：A->B和B->A
+        - 记录原始图像、模型生成图像和翻译结果
+        - 将图像网格上传到SwanLab进行可视化
+        """
         accelerator = self.accelerator
         device = accelerator.device
 
@@ -697,7 +899,22 @@ class Trainer(object):
                         self.net_G_B.eval()
 
                         with torch.no_grad():
-                            src_img = batch["src_img"]
+                            # Use fixed test data for consistent sampling
+                            if self.test_dl is not None:
+                                fixed_batch = next(self.test_dl)
+                                for key in fixed_batch.keys():
+                                    if isinstance(fixed_batch[key], torch.Tensor):
+                                        fixed_batch[key] = fixed_batch[key].to(device)
+                                src_img_full = fixed_batch["src_img"]
+                                trg_img_full = fixed_batch["trg_img"]
+                            else:
+                                src_img_full = batch["src_img"]
+                                trg_img_full = batch["trg_img"]
+                            
+                            # Use smaller batch size for sampling to save memory
+                            sample_batch_size = min(16, src_img_full.shape[0])
+                            src_img = src_img_full[:sample_batch_size]
+                            trg_img = trg_img_full[:sample_batch_size]
 
                             x_s = self.get_latent_space(src_img, tag="src_img")
                             C_S = -1 * x_s
@@ -721,7 +938,6 @@ class Trainer(object):
                             pred_model1 = self.model1.sample(batch_size=src_img.shape[0],)
                             pred_model2 = self.model2.sample(batch_size=src_img.shape[0],)
 
-                            trg_img = batch["trg_img"]
                             x_t = self.get_latent_space(trg_img, tag="trg_img")
                             c_list2, noise2 = self.model2.reverse_q_sample_c_list_concat(trg_img)
                             target_input = []
@@ -748,29 +964,26 @@ class Trainer(object):
                             self.save_img(pred_img_src, milestone, tag=f"pred-translation-B2A")
                             
                             try:
-                                # 修复 SwanLab 图像颜色问题：转换为 PIL.Image 避免 make_grid 的 normalize 处理
                                 from torchvision.transforms import ToPILImage
                                 to_pil = ToPILImage()
                                 
-                                def tensor_to_pil(img_tensor):
-                                    """将 [0, 1] 或 [-1, 1] 的 tensor 转换为 PIL.Image"""
+                                def tensor_to_grid_pil(img_tensor):
                                     if img_tensor.min() < 0:
                                         img_display = (img_tensor + 1) / 2
                                     else:
                                         img_display = img_tensor
                                     img_display = torch.clamp(img_display, 0, 1)
-                                    if img_display.dim() == 4:
-                                        return to_pil(img_display[0].cpu())
-                                    else:
-                                        return to_pil(img_display.cpu())
+                                    nrow = 2 ** math.floor(math.log2(math.sqrt(img_display.shape[0]))) if img_display.dim() == 4 else 1
+                                    grid = tv.utils.make_grid(img_display, nrow=nrow)
+                                    return to_pil(grid.cpu())
                                 
                                 swanlab.log({
-                                    "samples/source_A": swanlab.Image(tensor_to_pil(src_img), caption=f"Source A at step {self.step}"),
-                                    "samples/source_B": swanlab.Image(tensor_to_pil(trg_img), caption=f"Source B at step {self.step}"),
-                                    "samples/model_A": swanlab.Image(tensor_to_pil(pred_model1), caption=f"Model A Sample at step {self.step}"),
-                                    "samples/model_B": swanlab.Image(tensor_to_pil(pred_model2), caption=f"Model B Sample at step {self.step}"),
-                                    "samples/translation_A2B": swanlab.Image(tensor_to_pil(pred_img_trg), caption=f"A→B Translation at step {self.step}"),
-                                    "samples/translation_B2A": swanlab.Image(tensor_to_pil(pred_img_src), caption=f"B→A Translation at step {self.step}"),
+                                    "samples/source_A": swanlab.Image(tensor_to_grid_pil(src_img), caption=f"Source A at step {self.step}"),
+                                    "samples/source_B": swanlab.Image(tensor_to_grid_pil(trg_img), caption=f"Source B at step {self.step}"),
+                                    "samples/model_A": swanlab.Image(tensor_to_grid_pil(pred_model1), caption=f"Model A Sample at step {self.step}"),
+                                    "samples/model_B": swanlab.Image(tensor_to_grid_pil(pred_model2), caption=f"Model B Sample at step {self.step}"),
+                                    "samples/translation_A2B": swanlab.Image(tensor_to_grid_pil(pred_img_trg), caption=f"A→B Translation at step {self.step}"),
+                                    "samples/translation_B2A": swanlab.Image(tensor_to_grid_pil(pred_img_src), caption=f"B→A Translation at step {self.step}"),
                                 }, step=self.step)
                             except Exception as e:
                                 print(f"Warning: Failed to log images to SwanLab at step {self.step}: {e}")
@@ -788,13 +1001,24 @@ class Trainer(object):
             swanlab.finish()
     
     def save_img(self, pred_img, milestone, tag=None):
+        """
+        保存图像到磁盘
+        
+        Args:
+            pred_img: 预测图像张量
+            milestone: 里程碑编号，用于文件名
+            tag: 图像标签，用于区分不同类型的图像
+            
+        Note:
+            如果tag中包含"source"，则将图像从[-1,1]范围转换到[0,1]范围
+            使用make_grid将多张图像排列成网格形式保存
+        """
         if "source" in tag:
             pred_img = (pred_img + 1) * 0.5
 
         nrow = 2 ** math.floor(math.log2(math.sqrt(pred_img.shape[0])))
         print(f"The image {tag} has been saved !!")
         tv.utils.save_image(pred_img, str(self.results_folder / f'sample-{milestone}-{tag}.png'), nrow=nrow)
-
 
 if __name__ == "__main__":
     args = parse_args()
