@@ -1,0 +1,36 @@
+{
+  "include": ["ddm", "unet", "util", "torch_utils", "metrics"],
+  "exclude": [
+    "**/__pycache__",
+    "**/*.pyc",
+    "**/.git",
+    "**/assets",
+    "**/configs/**",
+    "**/doc",
+    "**/evaluation",
+    "**/taming/data/**",
+    "**/taming/modules/autoencoder/lpips/**",
+    "**/ddm/taming/**",
+    "**/*.pth",
+    "**/*.pt",
+    "**/*.yaml",
+    "**/*.yml",
+    "**/*.md",
+    "**/*.txt",
+    "**/.git/**"
+  ],
+  "pythonVersion": "3.9",
+  "pythonPlatform": "Linux",
+  "typeCheckingMode": "basic",
+  "reportMissingImports": true,
+  "reportMissingTypeStubs": false,
+  "autoImportCompletions": true,
+  "indexGeneration": true,
+  "library": [
+    "torch",
+    "torchvision",
+    "numpy",
+    "PIL",
+    "einops"
+  ]
+}
