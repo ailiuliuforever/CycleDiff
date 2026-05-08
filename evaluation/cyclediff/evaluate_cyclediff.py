@@ -22,12 +22,57 @@ import torch.nn.functional as F
 import yaml
 import argparse
 import torchvision as tv
-from torch.utils.data import DataLoader
+import torchvision.transforms.functional as TF
+from torch.utils.data import DataLoader, Dataset
 from ddm.utils import construct_class_by_name, safe_torch_load
 from ddm.encoder_decoder import AutoencoderKL
 from util.mse_psnr_ssim_mssim import calculate_mse, calculate_psnr, calculate_ssim, calculate_msssim
 import numpy as np
 from fvcore.common.config import CfgNode
+from PIL import Image
+from pathlib import Path
+
+
+class PairedDataset(Dataset):
+    def __init__(self, source_folder, target_folder, image_size=[256, 256],
+                 normalize_to_neg_one_to_one=True):
+        super().__init__()
+        self.source_folder = Path(source_folder)
+        self.target_folder = Path(target_folder)
+        self.image_size = image_size
+        self.normalize_to_neg_one_to_one = normalize_to_neg_one_to_one
+
+        source_images = {p.name: p for p in self.source_folder.rglob('*')
+                         if p.suffix.lower() in ('.png', '.jpg', '.jpeg') and not p.name.startswith('._')}
+        target_images = {p.name: p for p in self.target_folder.rglob('*')
+                         if p.suffix.lower() in ('.png', '.jpg', '.jpeg') and not p.name.startswith('._')}
+
+        common_names = sorted(set(source_images.keys()) & set(target_images.keys()))
+        self.pairs = [(source_images[n], target_images[n]) for n in common_names]
+
+        if len(self.pairs) == 0:
+            print(f"  警告：配对数据集为空！source={source_folder}, target={target_folder}")
+            print(f"  源域图像数: {len(source_images)}, 目标域图像数: {len(target_images)}")
+
+    def __len__(self):
+        return len(self.pairs)
+
+    def __getitem__(self, index):
+        src_path, tgt_path = self.pairs[index]
+        src_img = Image.open(src_path).convert('RGB')
+        tgt_img = Image.open(tgt_path).convert('RGB')
+
+        src_img = TF.resize(src_img, self.image_size)
+        tgt_img = TF.resize(tgt_img, self.image_size)
+
+        src_img = TF.to_tensor(src_img)
+        tgt_img = TF.to_tensor(tgt_img)
+
+        if self.normalize_to_neg_one_to_one:
+            src_img = src_img * 2.0 - 1.0
+            tgt_img = tgt_img * 2.0 - 1.0
+
+        return {'source': src_img, 'target': tgt_img, 'img_name': src_path.name}
 
 
 def parse_args():
@@ -49,11 +94,13 @@ def parse_args():
                         help="Number of samples to evaluate")
     parser.add_argument("--use_test_set", action="store_true",
                         help="Use test set instead of train set")
-    parser.add_argument("--use_ema", action="store_true", default=True,
+    parser.add_argument("--use_ema", action="store_true", default=False,
                         help="Use EMA weights")
     parser.add_argument("--direction", type=str, default="both",
                         choices=["A2B", "B2A", "both"],
                         help="Evaluation direction")
+    parser.add_argument("--paired", action="store_true", default=False,
+                        help="Use paired data for evaluation (compare translated with target GT)")
     parser.add_argument("--seed", type=int, default=42,
                         help="Random seed for reproducibility")
     args = parser.parse_args()
@@ -209,8 +256,22 @@ def compute_c_diff_map(c_src, c_rec):
     return diff_rgb
 
 
+def _get_src_img(batch, device, paired):
+    if paired:
+        return batch['source'].to(device)
+    else:
+        return batch['image'].to(device)
+
+
+def _get_tgt_img(batch, device, paired):
+    if paired:
+        return batch['target'].to(device)
+    else:
+        return None
+
+
 def evaluate_c_translation(model1, model2, net_G_A, net_G_B, dataloader_a, dataloader_b,
-                           save_dir, device, num_samples=50, direction="both"):
+                           save_dir, device, num_samples=50, direction="both", paired=False):
     model1.eval()
     model2.eval()
     net_G_A.eval()
@@ -226,6 +287,8 @@ def evaluate_c_translation(model1, model2, net_G_A, net_G_B, dataloader_a, datal
         os.makedirs(os.path.join(a2b_dir, "source"), exist_ok=True)
         os.makedirs(os.path.join(a2b_dir, "translated"), exist_ok=True)
         os.makedirs(os.path.join(a2b_dir, "comparison"), exist_ok=True)
+        if paired:
+            os.makedirs(os.path.join(a2b_dir, "target_gt"), exist_ok=True)
 
         t_steps1 = get_t_steps(model1, device)
         total_samples = 0
@@ -235,7 +298,8 @@ def evaluate_c_translation(model1, model2, net_G_A, net_G_B, dataloader_a, datal
             for batch_idx, batch in enumerate(dataloader_a):
                 if total_samples >= num_samples:
                     break
-                src_img = batch['image'].to(device)
+                src_img = _get_src_img(batch, device, paired)
+                tgt_img = _get_tgt_img(batch, device, paired)
                 batch_size = src_img.shape[0]
 
                 c_list, noise = model1.reverse_q_sample_c_list_concat(src_img)
@@ -249,13 +313,25 @@ def evaluate_c_translation(model1, model2, net_G_A, net_G_B, dataloader_a, datal
                                         os.path.join(a2b_dir, "source", f"sample_{total_samples + i:03d}.png"))
                     tv.utils.save_image(pred_img[i:i + 1],
                                         os.path.join(a2b_dir, "translated", f"sample_{total_samples + i:03d}.png"))
+                    if paired and tgt_img is not None:
+                        tgt_display = (tgt_img[i:i + 1] + 1.0) / 2.0
+                        tv.utils.save_image(tgt_display,
+                                            os.path.join(a2b_dir, "target_gt", f"sample_{total_samples + i:03d}.png"))
 
                 n_compare = min(batch_size, 4)
-                grid = create_comparison_grid(
-                    [src_display[:n_compare], pred_img[:n_compare]],
-                    ["Source (RSI)", "Translated (Map)"],
-                    num_images=n_compare
-                )
+                if paired and tgt_img is not None:
+                    tgt_display = (tgt_img[:n_compare] + 1.0) / 2.0
+                    grid = create_comparison_grid(
+                        [src_display[:n_compare], pred_img[:n_compare], tgt_display],
+                        ["Source (RSI)", "Translated (Map)", "Target GT (Map)"],
+                        num_images=n_compare
+                    )
+                else:
+                    grid = create_comparison_grid(
+                        [src_display[:n_compare], pred_img[:n_compare]],
+                        ["Source (RSI)", "Translated (Map)"],
+                        num_images=n_compare
+                    )
                 comparison_grids.append(grid)
 
                 total_samples += batch_size
@@ -272,6 +348,8 @@ def evaluate_c_translation(model1, model2, net_G_A, net_G_B, dataloader_a, datal
         results['A2B'] = {'source_path': os.path.join(a2b_dir, "source"),
                           'translated_path': os.path.join(a2b_dir, "translated"),
                           'num_samples': min(total_samples, num_samples)}
+        if paired:
+            results['A2B']['target_gt_path'] = os.path.join(a2b_dir, "target_gt")
 
     if direction in ["B2A", "both"]:
         print("\n" + "=" * 60)
@@ -281,6 +359,8 @@ def evaluate_c_translation(model1, model2, net_G_A, net_G_B, dataloader_a, datal
         os.makedirs(os.path.join(b2a_dir, "source"), exist_ok=True)
         os.makedirs(os.path.join(b2a_dir, "translated"), exist_ok=True)
         os.makedirs(os.path.join(b2a_dir, "comparison"), exist_ok=True)
+        if paired:
+            os.makedirs(os.path.join(b2a_dir, "target_gt"), exist_ok=True)
 
         t_steps2 = get_t_steps(model2, device)
         total_samples = 0
@@ -290,7 +370,8 @@ def evaluate_c_translation(model1, model2, net_G_A, net_G_B, dataloader_a, datal
             for batch_idx, batch in enumerate(dataloader_b):
                 if total_samples >= num_samples:
                     break
-                src_img = batch['image'].to(device)
+                src_img = _get_src_img(batch, device, paired)
+                tgt_img = _get_tgt_img(batch, device, paired)
                 batch_size = src_img.shape[0]
 
                 c_list, noise = model2.reverse_q_sample_c_list_concat(src_img)
@@ -304,13 +385,25 @@ def evaluate_c_translation(model1, model2, net_G_A, net_G_B, dataloader_a, datal
                                         os.path.join(b2a_dir, "source", f"sample_{total_samples + i:03d}.png"))
                     tv.utils.save_image(pred_img[i:i + 1],
                                         os.path.join(b2a_dir, "translated", f"sample_{total_samples + i:03d}.png"))
+                    if paired and tgt_img is not None:
+                        tgt_display = (tgt_img[i:i + 1] + 1.0) / 2.0
+                        tv.utils.save_image(tgt_display,
+                                            os.path.join(b2a_dir, "target_gt", f"sample_{total_samples + i:03d}.png"))
 
                 n_compare = min(batch_size, 4)
-                grid = create_comparison_grid(
-                    [src_display[:n_compare], pred_img[:n_compare]],
-                    ["Source (Map)", "Translated (RSI)"],
-                    num_images=n_compare
-                )
+                if paired and tgt_img is not None:
+                    tgt_display = (tgt_img[:n_compare] + 1.0) / 2.0
+                    grid = create_comparison_grid(
+                        [src_display[:n_compare], pred_img[:n_compare], tgt_display],
+                        ["Source (Map)", "Translated (RSI)", "Target GT (RSI)"],
+                        num_images=n_compare
+                    )
+                else:
+                    grid = create_comparison_grid(
+                        [src_display[:n_compare], pred_img[:n_compare]],
+                        ["Source (Map)", "Translated (RSI)"],
+                        num_images=n_compare
+                    )
                 comparison_grids.append(grid)
 
                 total_samples += batch_size
@@ -327,12 +420,14 @@ def evaluate_c_translation(model1, model2, net_G_A, net_G_B, dataloader_a, datal
         results['B2A'] = {'source_path': os.path.join(b2a_dir, "source"),
                           'translated_path': os.path.join(b2a_dir, "translated"),
                           'num_samples': min(total_samples, num_samples)}
+        if paired:
+            results['B2A']['target_gt_path'] = os.path.join(b2a_dir, "target_gt")
 
     return results
 
 
 def evaluate_cycle_consistency(model1, model2, net_G_A, net_G_B, dataloader_a, dataloader_b,
-                               save_dir, device, num_samples=50, direction="both"):
+                               save_dir, device, num_samples=50, direction="both", paired=False):
     model1.eval()
     model2.eval()
     net_G_A.eval()
@@ -375,14 +470,15 @@ def evaluate_cycle_consistency(model1, model2, net_G_A, net_G_B, dataloader_a, d
             for batch_idx, batch in enumerate(dataloader_a):
                 if total_samples >= num_samples:
                     break
-                src_img = batch['image'].to(device)
+                src_img = _get_src_img(batch, device, paired)
                 batch_size = src_img.shape[0]
 
                 c_list_src, noise_src = model1.reverse_q_sample_c_list_concat(src_img)
                 target_input_fwd = translate_c_list(c_list_src, noise_src, net_G_A, t_steps1, batch_size)
                 fwd_img = model2.sample_from_c_list(batch_size=batch_size, c_list=target_input_fwd)
 
-                c_list_fwd, noise_fwd = model2.reverse_q_sample_c_list_concat(fwd_img)
+                fwd_img_normalized = fwd_img * 2.0 - 1.0
+                c_list_fwd, noise_fwd = model2.reverse_q_sample_c_list_concat(fwd_img_normalized)
                 t_steps2 = get_t_steps(model2, device)
                 target_input_bwd = translate_c_list(c_list_fwd, noise_fwd, net_G_B, t_steps2, batch_size)
                 rec_img = model1.sample_from_c_list(batch_size=batch_size, c_list=target_input_bwd)
@@ -430,7 +526,7 @@ def evaluate_cycle_consistency(model1, model2, net_G_A, net_G_B, dataloader_a, d
                 c_cycle_lpips_scores.extend(c_lpips_val.flatten().cpu().numpy().tolist())
 
                 fwd_latent = model2.scale_factor * model2.get_first_stage_encoding(
-                    model2.first_stage_model.encode(fwd_img * 2.0 - 1.0))
+                    model2.first_stage_model.encode(fwd_img_normalized))
                 c_fwd = -1 * fwd_latent
 
                 c_src_display = normalize_c_to_display(c_src)
@@ -546,14 +642,15 @@ def evaluate_cycle_consistency(model1, model2, net_G_A, net_G_B, dataloader_a, d
             for batch_idx, batch in enumerate(dataloader_b):
                 if total_samples >= num_samples:
                     break
-                src_img = batch['image'].to(device)
+                src_img = _get_src_img(batch, device, paired)
                 batch_size = src_img.shape[0]
 
                 c_list_src, noise_src = model2.reverse_q_sample_c_list_concat(src_img)
                 target_input_fwd = translate_c_list(c_list_src, noise_src, net_G_B, t_steps2, batch_size)
                 fwd_img = model1.sample_from_c_list(batch_size=batch_size, c_list=target_input_fwd)
 
-                c_list_fwd, noise_fwd = model1.reverse_q_sample_c_list_concat(fwd_img)
+                fwd_img_normalized = fwd_img * 2.0 - 1.0
+                c_list_fwd, noise_fwd = model1.reverse_q_sample_c_list_concat(fwd_img_normalized)
                 t_steps1 = get_t_steps(model1, device)
                 target_input_bwd = translate_c_list(c_list_fwd, noise_fwd, net_G_A, t_steps1, batch_size)
                 rec_img = model2.sample_from_c_list(batch_size=batch_size, c_list=target_input_bwd)
@@ -601,7 +698,7 @@ def evaluate_cycle_consistency(model1, model2, net_G_A, net_G_B, dataloader_a, d
                 c_cycle_lpips_scores.extend(c_lpips_val.flatten().cpu().numpy().tolist())
 
                 fwd_latent = model1.scale_factor * model1.get_first_stage_encoding(
-                    model1.first_stage_model.encode(fwd_img * 2.0 - 1.0))
+                    model1.first_stage_model.encode(fwd_img_normalized))
                 c_fwd = -1 * fwd_latent
 
                 c_src_display = normalize_c_to_display(c_src)
@@ -686,7 +783,7 @@ def evaluate_cycle_consistency(model1, model2, net_G_A, net_G_B, dataloader_a, d
 
 
 def evaluate_identity(model1, model2, net_G_A, net_G_B, dataloader_a, dataloader_b,
-                      save_dir, device, num_samples=50, direction="both"):
+                      save_dir, device, num_samples=50, direction="both", paired=False):
     model1.eval()
     model2.eval()
     net_G_A.eval()
@@ -710,7 +807,7 @@ def evaluate_identity(model1, model2, net_G_A, net_G_B, dataloader_a, dataloader
             for batch_idx, batch in enumerate(dataloader_a):
                 if total_samples >= num_samples:
                     break
-                src_img = batch['image'].to(device)
+                src_img = _get_src_img(batch, device, paired)
                 batch_size = src_img.shape[0]
 
                 c_list, noise = model1.reverse_q_sample_c_list_concat(src_img)
@@ -769,7 +866,7 @@ def evaluate_identity(model1, model2, net_G_A, net_G_B, dataloader_a, dataloader
             for batch_idx, batch in enumerate(dataloader_b):
                 if total_samples >= num_samples:
                     break
-                src_img = batch['image'].to(device)
+                src_img = _get_src_img(batch, device, paired)
                 batch_size = src_img.shape[0]
 
                 c_list, noise = model2.reverse_q_sample_c_list_concat(src_img)
@@ -816,7 +913,7 @@ def evaluate_identity(model1, model2, net_G_A, net_G_B, dataloader_a, dataloader
 
 
 def visualize_c_components(model1, model2, net_G_A, net_G_B, dataloader_a, dataloader_b,
-                           save_dir, device, num_samples=4, direction="both"):
+                           save_dir, device, num_samples=4, direction="both", paired=False):
     model1.eval()
     model2.eval()
     net_G_A.eval()
@@ -835,7 +932,7 @@ def visualize_c_components(model1, model2, net_G_A, net_G_B, dataloader_a, datal
             for batch_idx, batch in enumerate(dataloader_a):
                 if batch_idx >= 1:
                     break
-                src_img = batch['image'].to(device)
+                src_img = _get_src_img(batch, device, paired)
                 batch_size = min(src_img.shape[0], num_samples)
 
                 c_list, noise = model1.reverse_q_sample_c_list_concat(src_img)
@@ -882,7 +979,7 @@ def visualize_c_components(model1, model2, net_G_A, net_G_B, dataloader_a, datal
             for batch_idx, batch in enumerate(dataloader_b):
                 if batch_idx >= 1:
                     break
-                src_img = batch['image'].to(device)
+                src_img = _get_src_img(batch, device, paired)
                 batch_size = min(src_img.shape[0], num_samples)
 
                 c_list, noise = model2.reverse_q_sample_c_list_concat(src_img)
@@ -918,7 +1015,7 @@ def visualize_c_components(model1, model2, net_G_A, net_G_B, dataloader_a, datal
 
 
 def calculate_c_space_metrics(model1, model2, net_G_A, net_G_B, dataloader_a, dataloader_b,
-                              device, num_samples=50, direction="both"):
+                              device, num_samples=50, direction="both", paired=False):
     model1.eval()
     model2.eval()
     net_G_A.eval()
@@ -938,7 +1035,8 @@ def calculate_c_space_metrics(model1, model2, net_G_A, net_G_B, dataloader_a, da
             for batch in dataloader_a:
                 if total_samples >= num_samples:
                     break
-                src_img = batch['image'].to(device)
+                src_img = _get_src_img(batch, device, paired)
+                tgt_img = _get_tgt_img(batch, device, paired)
                 batch_size = src_img.shape[0]
 
                 c_list, noise = model1.reverse_q_sample_c_list_concat(src_img)
@@ -950,22 +1048,27 @@ def calculate_c_space_metrics(model1, model2, net_G_A, net_G_B, dataloader_a, da
                 translated_c_last = net_G_A(c_list[-1], t_steps1[-1].repeat((batch_size,)))
                 translated_c_list.append(translated_c_last)
 
-                src_latent = model1.scale_factor * model1.get_first_stage_encoding(
-                    model1.first_stage_model.encode(src_img))
-                c_src = -1 * src_latent
-
                 target_input = translated_c_list + [noise]
                 pred_img = model2.sample_from_c_list(batch_size=batch_size, c_list=target_input)
                 pred_latent = model2.scale_factor * model2.get_first_stage_encoding(
                     model2.first_stage_model.encode(pred_img * 2.0 - 1.0))
-                c_trg = -1 * pred_latent
+                c_pred = -1 * pred_latent
 
-                c_src_flat = c_src.flatten(1)
-                c_trg_flat = c_trg.flatten(1)
+                if paired and tgt_img is not None:
+                    tgt_latent = model2.scale_factor * model2.get_first_stage_encoding(
+                        model2.first_stage_model.encode(tgt_img))
+                    c_ref = -1 * tgt_latent
+                else:
+                    src_latent = model1.scale_factor * model1.get_first_stage_encoding(
+                        model1.first_stage_model.encode(src_img))
+                    c_ref = -1 * src_latent
 
-                l1 = F.l1_loss(c_trg, c_src, reduction='none').mean(dim=[1, 2, 3])
-                l2 = F.mse_loss(c_trg, c_src, reduction='none').mean(dim=[1, 2, 3]).sqrt()
-                cos_sim = F.cosine_similarity(c_trg_flat, c_src_flat, dim=1)
+                c_pred_flat = c_pred.flatten(1)
+                c_ref_flat = c_ref.flatten(1)
+
+                l1 = F.l1_loss(c_pred, c_ref, reduction='none').mean(dim=[1, 2, 3])
+                l2 = F.mse_loss(c_pred, c_ref, reduction='none').mean(dim=[1, 2, 3]).sqrt()
+                cos_sim = F.cosine_similarity(c_pred_flat, c_ref_flat, dim=1)
 
                 c_l1_scores.extend(l1.cpu().numpy().tolist())
                 c_l2_scores.extend(l2.cpu().numpy().tolist())
@@ -973,6 +1076,7 @@ def calculate_c_space_metrics(model1, model2, net_G_A, net_G_B, dataloader_a, da
 
                 total_samples += batch_size
 
+        ref_label = "目标域GT" if paired else "源域"
         results['A2B_c_metrics'] = {
             'c_l1_mean': float(np.mean(c_l1_scores)),
             'c_l1_std': float(np.std(c_l1_scores)),
@@ -980,8 +1084,9 @@ def calculate_c_space_metrics(model1, model2, net_G_A, net_G_B, dataloader_a, da
             'c_l2_std': float(np.std(c_l2_scores)),
             'c_cos_mean': float(np.mean(c_cos_scores)),
             'c_cos_std': float(np.std(c_cos_scores)),
+            'reference': ref_label,
         }
-        print(f"  A→B C空间指标 - L1: {results['A2B_c_metrics']['c_l1_mean']:.6f}, "
+        print(f"  A→B C空间指标（对比{ref_label}） - L1: {results['A2B_c_metrics']['c_l1_mean']:.6f}, "
               f"L2: {results['A2B_c_metrics']['c_l2_mean']:.6f}, "
               f"余弦相似度: {results['A2B_c_metrics']['c_cos_mean']:.4f}")
 
@@ -997,7 +1102,8 @@ def calculate_c_space_metrics(model1, model2, net_G_A, net_G_B, dataloader_a, da
             for batch in dataloader_b:
                 if total_samples >= num_samples:
                     break
-                src_img = batch['image'].to(device)
+                src_img = _get_src_img(batch, device, paired)
+                tgt_img = _get_tgt_img(batch, device, paired)
                 batch_size = src_img.shape[0]
 
                 c_list, noise = model2.reverse_q_sample_c_list_concat(src_img)
@@ -1009,22 +1115,27 @@ def calculate_c_space_metrics(model1, model2, net_G_A, net_G_B, dataloader_a, da
                 translated_c_last = net_G_B(c_list[-1], t_steps2[-1].repeat((batch_size,)))
                 translated_c_list.append(translated_c_last)
 
-                src_latent = model2.scale_factor * model2.get_first_stage_encoding(
-                    model2.first_stage_model.encode(src_img))
-                c_src = -1 * src_latent
-
                 target_input = translated_c_list + [noise]
                 pred_img = model1.sample_from_c_list(batch_size=batch_size, c_list=target_input)
                 pred_latent = model1.scale_factor * model1.get_first_stage_encoding(
                     model1.first_stage_model.encode(pred_img * 2.0 - 1.0))
-                c_trg = -1 * pred_latent
+                c_pred = -1 * pred_latent
 
-                c_src_flat = c_src.flatten(1)
-                c_trg_flat = c_trg.flatten(1)
+                if paired and tgt_img is not None:
+                    tgt_latent = model1.scale_factor * model1.get_first_stage_encoding(
+                        model1.first_stage_model.encode(tgt_img))
+                    c_ref = -1 * tgt_latent
+                else:
+                    src_latent = model2.scale_factor * model2.get_first_stage_encoding(
+                        model2.first_stage_model.encode(src_img))
+                    c_ref = -1 * src_latent
 
-                l1 = F.l1_loss(c_trg, c_src, reduction='none').mean(dim=[1, 2, 3])
-                l2 = F.mse_loss(c_trg, c_src, reduction='none').mean(dim=[1, 2, 3]).sqrt()
-                cos_sim = F.cosine_similarity(c_trg_flat, c_src_flat, dim=1)
+                c_pred_flat = c_pred.flatten(1)
+                c_ref_flat = c_ref.flatten(1)
+
+                l1 = F.l1_loss(c_pred, c_ref, reduction='none').mean(dim=[1, 2, 3])
+                l2 = F.mse_loss(c_pred, c_ref, reduction='none').mean(dim=[1, 2, 3]).sqrt()
+                cos_sim = F.cosine_similarity(c_pred_flat, c_ref_flat, dim=1)
 
                 c_l1_scores.extend(l1.cpu().numpy().tolist())
                 c_l2_scores.extend(l2.cpu().numpy().tolist())
@@ -1032,6 +1143,7 @@ def calculate_c_space_metrics(model1, model2, net_G_A, net_G_B, dataloader_a, da
 
                 total_samples += batch_size
 
+        ref_label = "目标域GT" if paired else "源域"
         results['B2A_c_metrics'] = {
             'c_l1_mean': float(np.mean(c_l1_scores)),
             'c_l1_std': float(np.std(c_l1_scores)),
@@ -1039,44 +1151,59 @@ def calculate_c_space_metrics(model1, model2, net_G_A, net_G_B, dataloader_a, da
             'c_l2_std': float(np.std(c_l2_scores)),
             'c_cos_mean': float(np.mean(c_cos_scores)),
             'c_cos_std': float(np.std(c_cos_scores)),
+            'reference': ref_label,
         }
-        print(f"  B→A C空间指标 - L1: {results['B2A_c_metrics']['c_l1_mean']:.6f}, "
+        print(f"  B→A C空间指标（对比{ref_label}） - L1: {results['B2A_c_metrics']['c_l1_mean']:.6f}, "
               f"L2: {results['B2A_c_metrics']['c_l2_mean']:.6f}, "
               f"余弦相似度: {results['B2A_c_metrics']['c_cos_mean']:.4f}")
 
     return results
 
 
-def calculate_translation_metrics(save_dir, direction="both"):
+def calculate_translation_metrics(save_dir, direction="both", paired=False):
     metrics = {}
 
     if direction in ["A2B", "both"]:
         a2b_dir = os.path.join(save_dir, "A2B_translation")
-        source_path = os.path.join(a2b_dir, "source")
         translated_path = os.path.join(a2b_dir, "translated")
-        if os.path.exists(source_path) and os.path.exists(translated_path):
-            print("\n正在计算 A→B 翻译重建指标...")
-            mse = calculate_mse(translated_path, source_path)
-            psnr = calculate_psnr(translated_path, source_path)
-            ssim = calculate_ssim(translated_path, source_path)
-            msssim = calculate_msssim(translated_path, source_path)
+        if paired:
+            reference_path = os.path.join(a2b_dir, "target_gt")
+            metric_label = "A→B 翻译精度（vs 目标域GT）"
+        else:
+            reference_path = os.path.join(a2b_dir, "source")
+            metric_label = "A→B 翻译重建指标（vs 源域，仅供参考）"
+
+        if os.path.exists(reference_path) and os.path.exists(translated_path):
+            print(f"\n正在计算 {metric_label}...")
+            mse = calculate_mse(translated_path, reference_path)
+            psnr = calculate_psnr(translated_path, reference_path)
+            ssim = calculate_ssim(translated_path, reference_path)
+            msssim = calculate_msssim(translated_path, reference_path)
             metrics['A2B_reconstruction'] = {
-                'mse': mse, 'psnr': psnr, 'ssim': ssim, 'ms_ssim': msssim
+                'mse': mse, 'psnr': psnr, 'ssim': ssim, 'ms_ssim': msssim,
+                'reference': 'target_gt' if paired else 'source',
             }
             print(f"  MSE: {mse:.6f}, PSNR: {psnr:.2f} dB, SSIM: {ssim:.4f}, MS-SSIM: {msssim:.4f}")
 
     if direction in ["B2A", "both"]:
         b2a_dir = os.path.join(save_dir, "B2A_translation")
-        source_path = os.path.join(b2a_dir, "source")
         translated_path = os.path.join(b2a_dir, "translated")
-        if os.path.exists(source_path) and os.path.exists(translated_path):
-            print("\n正在计算 B→A 翻译重建指标...")
-            mse = calculate_mse(translated_path, source_path)
-            psnr = calculate_psnr(translated_path, source_path)
-            ssim = calculate_ssim(translated_path, source_path)
-            msssim = calculate_msssim(translated_path, source_path)
+        if paired:
+            reference_path = os.path.join(b2a_dir, "target_gt")
+            metric_label = "B→A 翻译精度（vs 目标域GT）"
+        else:
+            reference_path = os.path.join(b2a_dir, "source")
+            metric_label = "B→A 翻译重建指标（vs 源域，仅供参考）"
+
+        if os.path.exists(reference_path) and os.path.exists(translated_path):
+            print(f"\n正在计算 {metric_label}...")
+            mse = calculate_mse(translated_path, reference_path)
+            psnr = calculate_psnr(translated_path, reference_path)
+            ssim = calculate_ssim(translated_path, reference_path)
+            msssim = calculate_msssim(translated_path, reference_path)
             metrics['B2A_reconstruction'] = {
-                'mse': mse, 'psnr': psnr, 'ssim': ssim, 'ms_ssim': msssim
+                'mse': mse, 'psnr': psnr, 'ssim': ssim, 'ms_ssim': msssim,
+                'reference': 'target_gt' if paired else 'source',
             }
             print(f"  MSE: {mse:.6f}, PSNR: {psnr:.2f} dB, SSIM: {ssim:.4f}, MS-SSIM: {msssim:.4f}")
 
@@ -1084,7 +1211,7 @@ def calculate_translation_metrics(save_dir, direction="both"):
 
 
 def calculate_lpips_metrics(model1, model2, net_G_A, net_G_B, dataloader_a, dataloader_b,
-                            device, num_samples=50, direction="both"):
+                            device, num_samples=50, direction="both", paired=False):
     from taming.modules.losses.lpips import LPIPS
 
     lpips_model = LPIPS().eval().to(device)
@@ -1100,7 +1227,8 @@ def calculate_lpips_metrics(model1, model2, net_G_A, net_G_B, dataloader_a, data
             for batch in dataloader_a:
                 if total_samples >= num_samples:
                     break
-                src_img = batch['image'].to(device)
+                src_img = _get_src_img(batch, device, paired)
+                tgt_img = _get_tgt_img(batch, device, paired)
                 batch_size = src_img.shape[0]
 
                 c_list, noise = model1.reverse_q_sample_c_list_concat(src_img)
@@ -1108,16 +1236,21 @@ def calculate_lpips_metrics(model1, model2, net_G_A, net_G_B, dataloader_a, data
                 pred_img = model2.sample_from_c_list(batch_size=batch_size, c_list=target_input)
 
                 pred_norm = pred_img * 2.0 - 1.0
-                lpips_score = lpips_model(src_img, pred_norm)
+                if paired and tgt_img is not None:
+                    lpips_score = lpips_model(tgt_img, pred_norm)
+                else:
+                    lpips_score = lpips_model(src_img, pred_norm)
                 lpips_scores.append(lpips_score.mean().item())
 
                 total_samples += batch_size
 
+        ref_label = "目标域GT" if paired else "源域"
         results['A2B_lpips'] = {
             'mean': float(np.mean(lpips_scores)),
-            'std': float(np.std(lpips_scores))
+            'std': float(np.std(lpips_scores)),
+            'reference': ref_label,
         }
-        print(f"  A→B LPIPS: {results['A2B_lpips']['mean']:.6f} ± {results['A2B_lpips']['std']:.6f}")
+        print(f"  A→B LPIPS（vs {ref_label}）: {results['A2B_lpips']['mean']:.6f} ± {results['A2B_lpips']['std']:.6f}")
 
     if direction in ["B2A", "both"]:
         print("\n正在计算 B→A 方向 LPIPS...")
@@ -1129,7 +1262,8 @@ def calculate_lpips_metrics(model1, model2, net_G_A, net_G_B, dataloader_a, data
             for batch in dataloader_b:
                 if total_samples >= num_samples:
                     break
-                src_img = batch['image'].to(device)
+                src_img = _get_src_img(batch, device, paired)
+                tgt_img = _get_tgt_img(batch, device, paired)
                 batch_size = src_img.shape[0]
 
                 c_list, noise = model2.reverse_q_sample_c_list_concat(src_img)
@@ -1137,16 +1271,21 @@ def calculate_lpips_metrics(model1, model2, net_G_A, net_G_B, dataloader_a, data
                 pred_img = model1.sample_from_c_list(batch_size=batch_size, c_list=target_input)
 
                 pred_norm = pred_img * 2.0 - 1.0
-                lpips_score = lpips_model(src_img, pred_norm)
+                if paired and tgt_img is not None:
+                    lpips_score = lpips_model(tgt_img, pred_norm)
+                else:
+                    lpips_score = lpips_model(src_img, pred_norm)
                 lpips_scores.append(lpips_score.mean().item())
 
                 total_samples += batch_size
 
+        ref_label = "目标域GT" if paired else "源域"
         results['B2A_lpips'] = {
             'mean': float(np.mean(lpips_scores)),
-            'std': float(np.std(lpips_scores))
+            'std': float(np.std(lpips_scores)),
+            'reference': ref_label,
         }
-        print(f"  B→A LPIPS: {results['B2A_lpips']['mean']:.6f} ± {results['B2A_lpips']['std']:.6f}")
+        print(f"  B→A LPIPS（vs {ref_label}）: {results['B2A_lpips']['mean']:.6f} ± {results['B2A_lpips']['std']:.6f}")
 
     return results
 
@@ -1166,6 +1305,8 @@ def save_metrics(metrics, save_dir):
                 f.write(f"  {key} 翻译:\n")
                 f.write(f"    源域图像：{info.get('source_path', 'N/A')}\n")
                 f.write(f"    翻译图像：{info.get('translated_path', 'N/A')}\n")
+                if 'target_gt_path' in info:
+                    f.write(f"    目标域GT：{info.get('target_gt_path', 'N/A')}\n")
         for key in ['ABA', 'BAB']:
             cycle_key = f'cycle_{key}'
             if cycle_key in metrics.get('cycle', {}):
@@ -1228,33 +1369,65 @@ def main(args):
     data_test_cfg_a = cfg.get('data_test', {})
     data_test_cfg_b = cfg.get('data_test2', {})
 
-    if args.use_test_set:
-        if data_test_cfg_a:
-            data_test_cfg_a['split'] = 'test'
-        if data_test_cfg_b:
-            data_test_cfg_b['split'] = 'test'
-        print(f"   使用测试集进行评估")
+    if args.paired:
+        print(f"   使用配对数据模式（--paired）")
+
+        data_root = cfg.get('data', {}).get('data_root', '')
+        source_folder_name = cfg.get('data', {}).get('source_folder_name', 'class_RSI')
+        target_folder_name = cfg.get('data', {}).get('target_folder_name', 'class_Map')
+
+        if args.use_test_set:
+            src_folder = os.path.join(data_root, 'test', source_folder_name)
+            tgt_folder = os.path.join(data_root, 'test', target_folder_name)
+            print(f"   使用测试集进行配对评估")
+        else:
+            src_folder = os.path.join(data_root, 'train', source_folder_name)
+            tgt_folder = os.path.join(data_root, 'train', target_folder_name)
+            print(f"   使用训练集进行配对评估")
+
+        dataset_a = PairedDataset(
+            source_folder=src_folder,
+            target_folder=tgt_folder,
+            image_size=[256, 256],
+            normalize_to_neg_one_to_one=True,
+        )
+
+        dataset_b = PairedDataset(
+            source_folder=tgt_folder,
+            target_folder=src_folder,
+            image_size=[256, 256],
+            normalize_to_neg_one_to_one=True,
+        )
     else:
-        data_cfg = cfg.get('data', {})
-        data_cfg_a = dict(data_cfg)
-        data_cfg_a['split'] = 'train'
-        data_cfg_a['image_size'] = [256, 256]
-        data_cfg_a.pop('batch_size', None)
-        data_cfg_a['class_name'] = 'ddm.data.Single_dataset'
-        data_cfg_a['datafolder_name'] = data_cfg.get('source_folder_name', 'class_RSI')
-        data_test_cfg_a = data_cfg_a
+        if args.use_test_set:
+            if data_test_cfg_a:
+                data_test_cfg_a['split'] = 'test'
+            if data_test_cfg_b:
+                data_test_cfg_b['split'] = 'test'
+            print(f"   使用测试集进行评估")
+        else:
+            data_cfg = cfg.get('data', {})
+            data_cfg_a = dict(data_cfg)
+            data_cfg_a['split'] = 'train'
+            data_cfg_a['image_size'] = [256, 256]
+            data_cfg_a.pop('batch_size', None)
+            data_cfg_a['augment_horizontal_flip'] = False
+            data_cfg_a['class_name'] = 'ddm.data.Single_dataset'
+            data_cfg_a['datafolder_name'] = data_cfg.get('source_folder_name', 'class_RSI')
+            data_test_cfg_a = data_cfg_a
 
-        data_cfg_b = dict(data_cfg)
-        data_cfg_b['split'] = 'train'
-        data_cfg_b['image_size'] = [256, 256]
-        data_cfg_b.pop('batch_size', None)
-        data_cfg_b['class_name'] = 'ddm.data.Single_dataset'
-        data_cfg_b['datafolder_name'] = data_cfg.get('target_folder_name', 'class_Map')
-        data_test_cfg_b = data_cfg_b
-        print(f"   使用训练集进行评估")
+            data_cfg_b = dict(data_cfg)
+            data_cfg_b['split'] = 'train'
+            data_cfg_b['image_size'] = [256, 256]
+            data_cfg_b.pop('batch_size', None)
+            data_cfg_b['augment_horizontal_flip'] = False
+            data_cfg_b['class_name'] = 'ddm.data.Single_dataset'
+            data_cfg_b['datafolder_name'] = data_cfg.get('target_folder_name', 'class_Map')
+            data_test_cfg_b = data_cfg_b
+            print(f"   使用训练集进行评估（已禁用随机增强）")
 
-    dataset_a = construct_class_by_name(**data_test_cfg_a)
-    dataset_b = construct_class_by_name(**data_test_cfg_b)
+        dataset_a = construct_class_by_name(**data_test_cfg_a)
+        dataset_b = construct_class_by_name(**data_test_cfg_b)
     dataloader_a = DataLoader(dataset_a, batch_size=args.batch_size, shuffle=False,
                               num_workers=2, pin_memory=True)
     dataloader_b = DataLoader(dataset_b, batch_size=args.batch_size, shuffle=False,
@@ -1272,7 +1445,7 @@ def main(args):
     print("=" * 60)
     translation_results = evaluate_c_translation(
         model1, model2, net_G_A, net_G_B, dataloader_a, dataloader_b,
-        args.save_dir, device, args.num_samples, args.direction
+        args.save_dir, device, args.num_samples, args.direction, paired=args.paired
     )
     all_metrics['translation'] = translation_results
 
@@ -1281,7 +1454,7 @@ def main(args):
     print("=" * 60)
     cycle_results = evaluate_cycle_consistency(
         model1, model2, net_G_A, net_G_B, dataloader_a, dataloader_b,
-        args.save_dir, device, args.num_samples, args.direction
+        args.save_dir, device, args.num_samples, args.direction, paired=args.paired
     )
     all_metrics['cycle'] = cycle_results
 
@@ -1290,7 +1463,7 @@ def main(args):
     print("=" * 60)
     identity_results = evaluate_identity(
         model1, model2, net_G_A, net_G_B, dataloader_a, dataloader_b,
-        args.save_dir, device, args.num_samples, args.direction
+        args.save_dir, device, args.num_samples, args.direction, paired=args.paired
     )
     all_metrics['identity'] = identity_results
 
@@ -1299,7 +1472,7 @@ def main(args):
     print("=" * 60)
     visualize_c_components(
         model1, model2, net_G_A, net_G_B, dataloader_a, dataloader_b,
-        args.save_dir, device, num_samples=4, direction=args.direction
+        args.save_dir, device, num_samples=4, direction=args.direction, paired=args.paired
     )
 
     if args.cal_metrics:
@@ -1307,19 +1480,19 @@ def main(args):
         print("定量评估")
         print("=" * 60)
 
-        recon_metrics = calculate_translation_metrics(args.save_dir, args.direction)
+        recon_metrics = calculate_translation_metrics(args.save_dir, args.direction, paired=args.paired)
         all_metrics['reconstruction'] = recon_metrics
 
         c_metrics = calculate_c_space_metrics(
             model1, model2, net_G_A, net_G_B, dataloader_a, dataloader_b,
-            device, args.num_samples, args.direction
+            device, args.num_samples, args.direction, paired=args.paired
         )
         all_metrics['c_space'] = c_metrics
 
         try:
             lpips_results = calculate_lpips_metrics(
                 model1, model2, net_G_A, net_G_B, dataloader_a, dataloader_b,
-                device, args.num_samples, args.direction
+                device, args.num_samples, args.direction, paired=args.paired
             )
             all_metrics['lpips'] = lpips_results
         except Exception as e:
