@@ -919,8 +919,7 @@ class NYUDv2DepthDataset2(data.Dataset):
         ])
         self.transform_test = Compose([
             Resize(image_size),
-            # RandomHorizontalFlip() if augment_horizontal_flip else Identity(),
-            # ToTensor()
+            CenterCrop((256, 256)),
         ])
 
     def __len__(self):
@@ -1202,8 +1201,7 @@ class Paired_dataset(data.Dataset):
         ])
         self.transform_test = Compose([
             Resize(image_size),
-            # RandomHorizontalFlip() if augment_horizontal_flip else Identity(),
-            # ToTensor()
+            CenterCrop((256, 256)),
         ])
 
     def __len__(self):
@@ -1271,12 +1269,10 @@ class RGB_Unpair_dataset(data.Dataset):
             Resize(image_size),
             RandomCrop((256, 256)),
             RandomHorizontalFlip() if augment_horizontal_flip else Identity(),
-            # ToTensor()
         ])
         self.transform_test = Compose([
             Resize(image_size),
-            # RandomHorizontalFlip() if augment_horizontal_flip else Identity(),
-            # ToTensor()
+            CenterCrop((256, 256)),
         ])
 
     def __len__(self):
