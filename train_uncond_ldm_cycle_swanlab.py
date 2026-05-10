@@ -15,6 +15,7 @@ from torch.utils.data import DataLoader
 from multiprocessing import cpu_count
 from fvcore.common.config import CfgNode
 from ddm.loss import *
+from util.c_gradient_loss import c_gradient_loss_weighted
 from ddm.ddm_const import SpecifyGradient2
 import swanlab
 from datetime import datetime
@@ -621,6 +622,13 @@ class Trainer(object):
                 recon_C_T = self.net_G_A(fake_C_S, t)
                 idt_C_T = self.net_G_A(input_C_T, t)
 
+                loss_c_grad = torch.tensor(0.0, device=fake_C_T.device)
+                if hasattr(self.cfg.trainer, "c_gradient_weight"):
+                    loss_c_grad = c_gradient_loss_weighted(
+                        fake_C_T, input_C_T,
+                        edge_weight=self.cfg.trainer.get('c_gradient_edge_boost', 10.0)
+                    ) * self.cfg.trainer.c_gradient_weight
+
                 loss_ldm = self.cfg.trainer.ft_weight * (F.mse_loss(pred_C_S, C_S) + F.mse_loss(pred_C_T, C_T) + F.mse_loss(pred_noise_C_S, noise) + F.mse_loss(pred_noise_C_T, noise2))
                 loss_idt = F.l1_loss(idt_C_S, input_C_S) * self.cfg.trainer.idt_weight * self.cfg.trainer.get('cycle_ABA_weight', self.cfg.trainer.cycle_weight) + F.l1_loss(idt_C_T, input_C_T) * self.cfg.trainer.idt_weight * self.cfg.trainer.get('cycle_BAB_weight', self.cfg.trainer.cycle_weight)
                 loss_cycle_ABA = F.l1_loss(recon_C_S, input_C_S) * self.cfg.trainer.get('cycle_ABA_weight', self.cfg.trainer.cycle_weight)
@@ -632,7 +640,7 @@ class Trainer(object):
                 loss_perceptual = (self.perceptual_loss(input_C_S, recon_C_S).mean([1, 2, 3]) + self.perceptual_loss(input_C_T, recon_C_T).mean([1, 2, 3])).mean() * self.cfg.trainer.perceptual_weight
 
                 loss_ddm = loss_ldm
-                loss_gen_toal =  loss_idt + loss_G_adv_B + loss_G_adv_A + loss_cycle_ABA + loss_cycle_BAB + loss_perceptual + loss_ldm
+                loss_gen_toal =  loss_idt + loss_G_adv_B + loss_G_adv_A + loss_cycle_ABA + loss_cycle_BAB + loss_perceptual + loss_ldm + loss_c_grad
 
                 loss_dict = {"{}/loss_gen_toal".format(split): loss_gen_toal.detach(),
                    "{}/loss_idt".format(split): loss_idt.detach(),
@@ -640,6 +648,7 @@ class Trainer(object):
                    "{}/loss_G_adv_B".format(split): loss_G_adv_B.detach(),
                    "{}/loss_cycle_ABA".format(split): loss_cycle_ABA.detach(),
                    "{}/loss_cycle_BAB".format(split): loss_cycle_BAB.detach(),
+"{}/loss_c_grad".format(split): loss_c_grad.detach(),
                    "{}/loss_ldm".format(split): loss_ldm.detach(),
                    "{}/loss_perceptual".format(split): loss_perceptual.detach()
                    }
