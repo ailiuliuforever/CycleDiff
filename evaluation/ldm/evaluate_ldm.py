@@ -88,6 +88,8 @@ def load_ldm_model(cfg, ckpt_path, device):
 
     model = model.to(device)
     model.eval()
+    # Use 100 sampling steps (matching paper) for better reconstruction
+    model.sampling_timesteps = 100
     return model
 
 
@@ -386,6 +388,8 @@ def main(args):
     else:
         data_cfg['split'] = 'train'
         print(f"   使用训练集进行评估")
+    # Override image_size to 256 to match model's expected latent resolution (64x64 at 4x downsample)
+    data_cfg['image_size'] = [256, 256]
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 

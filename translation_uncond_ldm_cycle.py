@@ -263,10 +263,26 @@ class Sampler(object):
                             step - self.model1.sigma_max ** (1 / rho))) ** rho
                     t_steps = reversed(torch.cat([t_steps, torch.zeros_like(t_steps[:1])]))
 
-                    for i in range(len(c_list[:-1])):
-                        target_input.append(self.net_G_A(c_list[i], t_steps[i+1].repeat((x_s.shape[0],))))
+                    def _get_scale_id(t_vals, B):
+                        sid = []
+                        for tv in t_vals:
+                            if tv < 0.3:
+                                sid.append(0)
+                            elif tv < 0.6:
+                                sid.append(1)
+                            else:
+                                sid.append(2)
+                        return torch.tensor(sid, dtype=torch.long, device=device).unsqueeze(0).repeat(B, 1).t().reshape(-1)
 
-                    target_input.append(self.net_G_A(c_list[-1], t_steps[-1].repeat((x_s.shape[0],))))
+                    batch_size = x_s.shape[0]
+                    for i in range(len(c_list[:-1])):
+                        t_i = t_steps[i+1].repeat((batch_size,))
+                        sid = _get_scale_id([t_steps[i+1].item()], batch_size)
+                        target_input.append(self.net_G_A(c_list[i], t_i, scale_id=sid))
+
+                    t_last = t_steps[-1].repeat((batch_size,))
+                    sid_last = _get_scale_id([t_steps[-1].item()], batch_size)
+                    target_input.append(self.net_G_A(c_list[-1], t_last, scale_id=sid_last))
                     target_input.append(noise)
                     pred_img = self.model2.sample_from_c_list(batch_size=src_img.shape[0], c_list=target_input)
 
@@ -284,10 +300,15 @@ class Sampler(object):
                             step - self.model2.sigma_max ** (1 / rho))) ** rho
                     t_steps = reversed(torch.cat([t_steps, torch.zeros_like(t_steps[:1])]))
 
+                    batch_size = x_t.shape[0]
                     for i in range(len(c_list2[:-1])):
-                        target_input.append(self.net_G_B(c_list2[i], t_steps[i+1].repeat((x_t.shape[0],))))
+                        t_i = t_steps[i+1].repeat((batch_size,))
+                        sid = _get_scale_id([t_steps[i+1].item()], batch_size)
+                        target_input.append(self.net_G_B(c_list2[i], t_i, scale_id=sid))
 
-                    target_input.append(self.net_G_B(c_list2[-1], t_steps[-1].repeat((x_t.shape[0],))))
+                    t_last = t_steps[-1].repeat((batch_size,))
+                    sid_last = _get_scale_id([t_steps[-1].item()], batch_size)
+                    target_input.append(self.net_G_B(c_list2[-1], t_last, scale_id=sid_last))
                     target_input.append(noise2)
                     pred_img = self.model1.sample_from_c_list(batch_size=trg_img.shape[0], c_list=target_input)
 

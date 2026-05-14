@@ -1,0 +1,241 @@
+data:
+  augment_horizontal_flip: true
+  batch_size: 20
+  class_name: ddm.data.RGB_Unpair_dataset
+  data_root: /root/autodl-tmp/CycleDiff/datasets/maps
+  image_size:
+  - 286
+  - 286
+  num_workers: 4
+  source_folder_name: class_RSI
+  split: train
+  target_folder_name: class_Map
+data_test:
+  augment_horizontal_flip: true
+  class_name: ddm.data.Single_dataset
+  data_root: /root/autodl-tmp/CycleDiff/datasets/maps
+  datafolder_name: class_RSI
+  image_size:
+  - 256
+  - 256
+  num_workers: 4
+  split: test
+data_test2:
+  augment_horizontal_flip: true
+  class_name: ddm.data.Single_dataset
+  data_root: /root/autodl-tmp/CycleDiff/datasets/maps
+  datafolder_name: class_Map
+  image_size:
+  - 256
+  - 256
+  num_workers: 4
+  split: test
+model1:
+  ckpt_path: null
+  class_name: ddm.ddm_const_ode_2.LatentDiffusion
+  default_scale: true
+  eps: 0.001
+  first_stage:
+    ckpt_path: /root/autodl-tmp/CycleDiff/results/rsi_ae_kl_256x256_d4/model-6.pt
+    class_name: ddm.encoder_decoder.AutoencoderKL
+    ddconfig:
+      attn_resolutions: []
+      ch: 128
+      ch_mult:
+      - 1
+      - 2
+      - 4
+      double_z: true
+      dropout: 0.0
+      in_channels: 3
+      num_res_blocks: 2
+      out_ch: 3
+      resolution:
+      - 256
+      - 256
+      z_channels: 3
+    embed_dim: 3
+    lossconfig:
+      disc_start: 20001
+      disc_weight: 0.5
+      kl_weight: 1.0e-06
+  ignore_keys: []
+  image_size:
+  - 256
+  - 256
+  ldm: true
+  loss_type: l2
+  only_model: false
+  perceptual_weight: 1
+  sampling_timesteps: 200
+  scale_by_softsign: false
+  scale_by_std: true
+  scale_factor: 0.165
+  sigma_max: 1
+  sigma_min: 0.001
+  start_dist: normal
+  unet:
+    attn_resolutions:
+    - 16
+    - 8
+    augment_dim: 0
+    channel_mult:
+    - 1
+    - 2
+    - 2
+    - 2
+    channel_mult_emb: 4
+    class_name: unet.uncond_unet_sd_2.EDMPrecond
+    dropout: 0.1
+    img_channels: 3
+    img_resolution: 64
+    label_dropout: 0
+    model_channels: 128
+    model_type: DhariwalUNet
+    num_blocks: 3
+    sigma_data: 1.0
+  use_augment: false
+  use_disloss: false
+  use_l1: false
+  weighting_loss: true
+model2:
+  ckpt_path: null
+  class_name: ddm.ddm_const_ode_2.LatentDiffusion
+  default_scale: true
+  eps: 0.001
+  first_stage:
+    ckpt_path: /root/autodl-tmp/CycleDiff/results/map_ae_kl_256x256_d4/model-10.pt
+    class_name: ddm.encoder_decoder.AutoencoderKL
+    ddconfig:
+      attn_resolutions: []
+      ch: 128
+      ch_mult:
+      - 1
+      - 2
+      - 4
+      double_z: true
+      dropout: 0.0
+      in_channels: 3
+      num_res_blocks: 2
+      out_ch: 3
+      resolution:
+      - 256
+      - 256
+      z_channels: 3
+    embed_dim: 3
+    lossconfig:
+      disc_start: 20001
+      disc_weight: 0.5
+      kl_weight: 1.0e-06
+  ignore_keys: []
+  image_size:
+  - 256
+  - 256
+  ldm: true
+  loss_type: l2
+  only_model: false
+  perceptual_weight: 1
+  sampling_timesteps: 200
+  scale_by_softsign: false
+  scale_by_std: true
+  scale_factor: 0.165
+  sigma_max: 1
+  sigma_min: 0.001
+  start_dist: normal
+  unet:
+    attn_resolutions:
+    - 16
+    - 8
+    augment_dim: 0
+    channel_mult:
+    - 1
+    - 2
+    - 2
+    - 2
+    channel_mult_emb: 4
+    class_name: unet.uncond_unet_sd_2.EDMPrecond
+    dropout: 0.1
+    img_channels: 3
+    img_resolution: 64
+    label_dropout: 0
+    model_channels: 128
+    model_type: DhariwalUNet
+    num_blocks: 3
+    sigma_data: 1.0
+  use_augment: false
+  use_disloss: false
+  use_l1: false
+  weighting_loss: true
+net_D:
+  class_name: ddm.cycle_discriminator.NLayerDiscriminator2
+  input_nc: 3
+  ndf: 64
+net_G:
+  class_name: ddm.cycle_generator_2.ResnetGenerator_timestep_restime_3_mhsa
+  dim: 128
+  input_nc: 3
+  mhsa_heads: 4
+  n_blocks: 12
+  ngf: 64
+  output_nc: 3
+sampler:
+  batch_size: 8
+  cal_metrics: true
+  ckpt_path: /root/autodl-tmp/CycleDiff/results/maps/exp_rebalanced_3k/model-1.pt
+  save_folder: /root/autodl-tmp/CycleDiff/evaluation/cyclediff/res_cgrad/sample_results
+  source_gt_path: /root/autodl-tmp/CycleDiff/datasets/maps/test/class_RSI
+  split: test
+  target_gt_path: /root/autodl-tmp/CycleDiff/datasets/maps/test/class_Map
+  task: rsi2map
+  test_in_train: false
+  use_ema: true
+trainer:
+  amp: false
+  c_gradient_edge_boost: 10.0
+  c_gradient_preserve_edge_boost: 10.0
+  c_gradient_preserve_weight: 2.0
+  c_gradient_weight: 3.0
+  c_ssim_data_range: 1.0
+  c_ssim_weight: 0.0
+  c_ssim_win_size: 5
+  ckpt_path1: /root/autodl-tmp/CycleDiff/results/maps/ddm_const_uncond_unet_ldm_rsi_2/model-5.pt
+  ckpt_path2: /root/autodl-tmp/CycleDiff/results/maps/ddm_const_uncond_unet_ldm_map/model-10.pt
+  cycle_ABA_weight: 30
+  cycle_BAB_weight: 20
+  cycle_weight: 30
+  d_A_weight: 1.0
+  d_B_weight: 1.5
+  ema_update_after_step: 500
+  ema_update_every: 8
+  fp16: false
+  ft_use_ema: true
+  ft_weight: 0.05
+  g_adv_A_weight: 0.0
+  g_adv_B_weight: 0.0
+  gradient_accumulate_every: 2
+  idt_weight: 1.0
+  log_freq: 100
+  lr: 1.0e-05
+  mcl_weight: 0.01
+  min_lr: 5.0e-06
+  perceptual_weight: 20
+  results_folder: /root/autodl-tmp/CycleDiff/results/maps/exp_rebalanced_3k
+  resume_milestone: 0
+  sample_every: 3000
+  save_every: 3000
+  scale_coarse_adv_weight: 10.0
+  scale_coarse_cycle_weight: 8
+  scale_coarse_percep_weight: 5
+  scale_coarse_ssim_weight: 1.0
+  scale_fine_adv_weight: 0.0
+  scale_fine_cycle_weight: 25
+  scale_fine_percep_weight: 12
+  scale_fine_ssim_weight: 15.0
+  scale_mid_adv_weight: 5.0
+  scale_mid_cycle_weight: 15
+  scale_mid_percep_weight: 8
+  scale_mid_ssim_weight: 5.0
+  temp: 0.1
+  test_before: false
+  train_num_steps: 3000
+  trans_net_lr: 0.0001

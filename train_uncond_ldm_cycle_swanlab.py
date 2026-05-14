@@ -15,7 +15,7 @@ from torch.utils.data import DataLoader
 from multiprocessing import cpu_count
 from fvcore.common.config import CfgNode
 from ddm.loss import *
-from util.c_gradient_loss import c_gradient_loss_weighted
+from util.c_ssim_loss import c_ms_ssim_loss
 from ddm.ddm_const import SpecifyGradient2
 import swanlab
 from datetime import datetime
@@ -160,9 +160,13 @@ def main(args):
                 t_steps = reversed(torch.cat([t_steps, torch.zeros_like(t_steps[:1])]))
 
                 for i in range(len(c_list[:-1])):
-                    target_input.append(trainer.net_G_A(c_list[i], t_steps[i+1].repeat((x_s.shape[0],))))
+                    sid = 0 if t_steps[i+1].item() < 0.3 else (1 if t_steps[i+1].item() < 0.6 else 2)
+                    sid_t = torch.full((x_s.shape[0],), sid, dtype=torch.long, device=device)
+                    target_input.append(trainer.net_G_A(c_list[i], t_steps[i+1].repeat((x_s.shape[0],)), scale_id=sid_t))
 
-                target_input.append(trainer.net_G_A(c_list[-1], t_steps[-1].repeat((x_s.shape[0],))))
+                sid_last = 0 if t_steps[-1].item() < 0.3 else (1 if t_steps[-1].item() < 0.6 else 2)
+                sid_t_last = torch.full((x_s.shape[0],), sid_last, dtype=torch.long, device=device)
+                target_input.append(trainer.net_G_A(c_list[-1], t_steps[-1].repeat((x_s.shape[0],)), scale_id=sid_t_last))
                 target_input.append(noise)
                 pred_img = trainer.model2.sample_from_c_list(batch_size=src_img.shape[0], c_list=target_input)
 
@@ -597,7 +601,18 @@ class Trainer(object):
             x_s = self.get_latent_space(x_s, tag="src_img")
 
             eps = self.model1.eps
-            t = torch.rand(x_s.shape[0], device=x_s.device) * (1. - eps) + eps
+            t_raw = torch.rand(x_s.shape[0], device=x_s.device) * (1.0 - eps) + eps
+            # Scale-disentangled 3-scale: fine 20%, mid 35%, coarse 45% (coarse-favored for anti-collapse)
+            rand_val = torch.rand(1, device=x_s.device).item()
+            if rand_val < 0.20:
+                t = eps + t_raw * 0.3
+                scale_id_A = torch.zeros(x_s.shape[0], dtype=torch.long, device=x_s.device)  # fine=0
+            elif rand_val < 0.55:
+                t = 0.3 + t_raw * 0.3
+                scale_id_A = torch.ones(x_s.shape[0], dtype=torch.long, device=x_s.device)   # mid=1
+            else:
+                t = 0.6 + t_raw * 0.4
+                scale_id_A = torch.full((x_s.shape[0],), 2, dtype=torch.long, device=x_s.device)  # coarse=2
             noise = torch.randn_like(x_s)
 
             C_S = -1 * x_s
@@ -606,7 +621,8 @@ class Trainer(object):
 
             with torch.autograd.set_detect_anomaly(True):
                 input_C_S = pred_C_S
-                fake_C_T = self.net_G_A(input_C_S, t)
+                scale_id_fine = torch.zeros_like(scale_id_A)  # identity/cycle always fine mode
+                fake_C_T = self.net_G_A(input_C_S, t, scale_id=scale_id_A)
                 recon_C_S = self.net_G_B(fake_C_T, t)
                 idt_C_S = self.net_G_B(input_C_S, t)
             
@@ -619,28 +635,53 @@ class Trainer(object):
 
                 input_C_T = pred_C_T
                 fake_C_S = self.net_G_B(input_C_T, t)
-                recon_C_T = self.net_G_A(fake_C_S, t)
-                idt_C_T = self.net_G_A(input_C_T, t)
-
-                loss_c_grad = torch.tensor(0.0, device=fake_C_T.device)
-                if hasattr(self.cfg.trainer, "c_gradient_weight"):
-                    loss_c_grad = c_gradient_loss_weighted(
-                        fake_C_T, input_C_T,
-                        edge_weight=self.cfg.trainer.get('c_gradient_edge_boost', 10.0)
-                    ) * self.cfg.trainer.c_gradient_weight
+                recon_C_T = self.net_G_A(fake_C_S, t, scale_id=scale_id_fine)
+                idt_C_T = self.net_G_A(input_C_T, t, scale_id=scale_id_fine)
 
                 loss_ldm = self.cfg.trainer.ft_weight * (F.mse_loss(pred_C_S, C_S) + F.mse_loss(pred_C_T, C_T) + F.mse_loss(pred_noise_C_S, noise) + F.mse_loss(pred_noise_C_T, noise2))
-                loss_idt = F.l1_loss(idt_C_S, input_C_S) * self.cfg.trainer.idt_weight * self.cfg.trainer.get('cycle_ABA_weight', self.cfg.trainer.cycle_weight) + F.l1_loss(idt_C_T, input_C_T) * self.cfg.trainer.idt_weight * self.cfg.trainer.get('cycle_BAB_weight', self.cfg.trainer.cycle_weight)
-                loss_cycle_ABA = F.l1_loss(recon_C_S, input_C_S) * self.cfg.trainer.get('cycle_ABA_weight', self.cfg.trainer.cycle_weight)
-                loss_cycle_BAB = F.l1_loss(recon_C_T, input_C_T) * self.cfg.trainer.get('cycle_BAB_weight', self.cfg.trainer.cycle_weight)
 
-                loss_G_adv_A = self.criterionGAN(self.net_D_A(fake_C_T), True) * self.cfg.trainer.get('g_adv_A_weight', 1.0)
-                loss_G_adv_B = self.criterionGAN(self.net_D_B(fake_C_S), True) * self.cfg.trainer.get('g_adv_B_weight', 1.0)
+                # Scale-aware loss weights (3-scale)
+                sid_val = scale_id_A[0].item()
+                if sid_val == 0:  # fine: structure preserve
+                    w_ssim   = self.cfg.trainer.get('scale_fine_ssim_weight', 15.0)
+                    w_adv    = self.cfg.trainer.get('scale_fine_adv_weight', 0.0)
+                    w_cycle  = self.cfg.trainer.get('scale_fine_cycle_weight', 40)
+                    w_percep = self.cfg.trainer.get('scale_fine_percep_weight', 20)
+                elif sid_val == 1:  # mid: balanced
+                    w_ssim   = self.cfg.trainer.get('scale_mid_ssim_weight', 8.0)
+                    w_adv    = self.cfg.trainer.get('scale_mid_adv_weight', 1.5)
+                    w_cycle  = self.cfg.trainer.get('scale_mid_cycle_weight', 30)
+                    w_percep = self.cfg.trainer.get('scale_mid_percep_weight', 15)
+                else:  # coarse (sid_val == 2): domain transfer
+                    w_ssim   = self.cfg.trainer.get('scale_coarse_ssim_weight', 3.0)
+                    w_adv    = self.cfg.trainer.get('scale_coarse_adv_weight', 3.0)
+                    w_cycle  = self.cfg.trainer.get('scale_coarse_cycle_weight', 20)
+                    w_percep = self.cfg.trainer.get('scale_coarse_percep_weight', 10)
 
-                loss_perceptual = (self.perceptual_loss(input_C_S, recon_C_S).mean([1, 2, 3]) + self.perceptual_loss(input_C_T, recon_C_T).mean([1, 2, 3])).mean() * self.cfg.trainer.perceptual_weight
+                loss_idt = F.l1_loss(idt_C_S, input_C_S) * self.cfg.trainer.idt_weight * w_cycle + F.l1_loss(idt_C_T, input_C_T) * self.cfg.trainer.idt_weight * w_cycle
+                loss_cycle_ABA = F.l1_loss(recon_C_S, input_C_S) * w_cycle
+                loss_cycle_BAB = F.l1_loss(recon_C_T, input_C_T) * w_cycle
+
+                loss_G_adv_A = self.criterionGAN(self.net_D_A(fake_C_T), True) * w_adv
+                loss_G_adv_B = self.criterionGAN(self.net_D_B(fake_C_S), True) * w_adv
+
+                loss_perceptual = (self.perceptual_loss(input_C_S, recon_C_S).mean([1, 2, 3]) + self.perceptual_loss(input_C_T, recon_C_T).mean([1, 2, 3])).mean() * w_percep
+
+                loss_c_ssim = (
+                    c_ms_ssim_loss(
+                        input_C_S, recon_C_S,
+                        win_size=self.cfg.trainer.get('c_ssim_win_size', 5),
+                        data_range=self.cfg.trainer.get('c_ssim_data_range', 1.0)
+                    ) +
+                    c_ms_ssim_loss(
+                        input_C_T, recon_C_T,
+                        win_size=self.cfg.trainer.get('c_ssim_win_size', 5),
+                        data_range=self.cfg.trainer.get('c_ssim_data_range', 1.0)
+                    )
+                ) * w_ssim
 
                 loss_ddm = loss_ldm
-                loss_gen_toal =  loss_idt + loss_G_adv_B + loss_G_adv_A + loss_cycle_ABA + loss_cycle_BAB + loss_perceptual + loss_ldm + loss_c_grad
+                loss_gen_toal =  loss_idt + loss_G_adv_B + loss_G_adv_A + loss_cycle_ABA + loss_cycle_BAB + loss_perceptual + loss_ldm + loss_c_ssim
 
                 loss_dict = {"{}/loss_gen_toal".format(split): loss_gen_toal.detach(),
                    "{}/loss_idt".format(split): loss_idt.detach(),
@@ -648,7 +689,7 @@ class Trainer(object):
                    "{}/loss_G_adv_B".format(split): loss_G_adv_B.detach(),
                    "{}/loss_cycle_ABA".format(split): loss_cycle_ABA.detach(),
                    "{}/loss_cycle_BAB".format(split): loss_cycle_BAB.detach(),
-"{}/loss_c_grad".format(split): loss_c_grad.detach(),
+                   "{}/loss_c_ssim".format(split): loss_c_ssim.detach(),
                    "{}/loss_ldm".format(split): loss_ldm.detach(),
                    "{}/loss_perceptual".format(split): loss_perceptual.detach()
                    }
@@ -785,6 +826,7 @@ class Trainer(object):
                             loss_cycle_BAB = log_dict["train/loss_cycle_BAB"]
                             loss_ldm = log_dict["train/loss_ldm"]
                             loss_perceptual = log_dict["train/loss_perceptual"]
+                            loss_c_ssim = log_dict["train/loss_c_ssim"]
                             loss_gen_toal = log_dict["train/loss_gen_toal"]
 
                             log_dict['lr_d1'] = self.opt_d1.param_groups[0]['lr']
@@ -856,6 +898,7 @@ class Trainer(object):
                     self.writer.add_scalar('Generator/loss_cycle_BAB', loss_cycle_BAB, self.step)
                     self.writer.add_scalar('Generator/loss_ldm', loss_ldm, self.step)
                     self.writer.add_scalar('Generator/loss_perceptual', loss_perceptual, self.step)
+                    self.writer.add_scalar('Generator/loss_c_ssim', loss_c_ssim, self.step)
                     self.writer.add_scalar('Generator/loss_gen_toal', loss_gen_toal, self.step)
                     self.writer.add_scalar('Discriminator/loss_D_A', loss_D_A, self.step)
                     self.writer.add_scalar('Discriminator/loss_ldm_D', loss_ldm_D, self.step)
@@ -871,8 +914,9 @@ class Trainer(object):
                         "Generator/loss_G_adv_B": loss_G_adv_B.item(),
                         "Generator/loss_cycle_ABA": loss_cycle_ABA.item(),
                         "Generator/loss_cycle_BAB": loss_cycle_BAB.item(),
-                        "Generator/loss_ldm": loss_ldm.item(),
-                        "Generator/loss_perceptual": loss_perceptual.item(),
+                            "Generator/loss_ldm": loss_ldm.item(),
+                            "Generator/loss_perceptual": loss_perceptual.item(),
+                            "Generator/loss_c_ssim": loss_c_ssim.item(),
                         "Discriminator/loss_dis_total": loss_dis_total.item(),
                         "Discriminator/loss_D_A": loss_D_A.item(),
                         "Discriminator/loss_D_B": loss_D_B.item(),
@@ -938,9 +982,13 @@ class Trainer(object):
                             t_steps = reversed(torch.cat([t_steps, torch.zeros_like(t_steps[:1])]))
 
                             for i in range(len(c_list[:-1])):
-                                target_input.append(self.net_G_A(c_list[i], t_steps[i+1].repeat((x_s.shape[0],))))
+                                sid = 0 if t_steps[i+1].item() < 0.3 else (1 if t_steps[i+1].item() < 0.6 else 2)
+                                sid_t = torch.full((x_s.shape[0],), sid, dtype=torch.long, device=device)
+                                target_input.append(self.net_G_A(c_list[i], t_steps[i+1].repeat((x_s.shape[0],)), scale_id=sid_t))
 
-                            target_input.append(self.net_G_A(c_list[-1], t_steps[-1].repeat((x_s.shape[0],))))
+                            sid_last = 0 if t_steps[-1].item() < 0.3 else (1 if t_steps[-1].item() < 0.6 else 2)
+                            sid_t_last = torch.full((x_s.shape[0],), sid_last, dtype=torch.long, device=device)
+                            target_input.append(self.net_G_A(c_list[-1], t_steps[-1].repeat((x_s.shape[0],)), scale_id=sid_t_last))
                             target_input.append(noise)
                             pred_img_trg = self.model2.sample_from_c_list(batch_size=src_img.shape[0], c_list=target_input)
 
@@ -959,9 +1007,13 @@ class Trainer(object):
                             t_steps = reversed(torch.cat([t_steps, torch.zeros_like(t_steps[:1])]))
 
                             for i in range(len(c_list2[:-1])):
-                                target_input.append(self.net_G_B(c_list2[i], t_steps[i+1].repeat((x_s.shape[0],))))
+                                sid = 0 if t_steps[i+1].item() < 0.3 else (1 if t_steps[i+1].item() < 0.6 else 2)
+                                sid_t = torch.full((x_s.shape[0],), sid, dtype=torch.long, device=device)
+                                target_input.append(self.net_G_B(c_list2[i], t_steps[i+1].repeat((x_s.shape[0],)), scale_id=sid_t))
 
-                            target_input.append(self.net_G_B(c_list2[-1], t_steps[-1].repeat((x_s.shape[0],))))
+                            sid_last = 0 if t_steps[-1].item() < 0.3 else (1 if t_steps[-1].item() < 0.6 else 2)
+                            sid_t_last = torch.full((x_s.shape[0],), sid_last, dtype=torch.long, device=device)
+                            target_input.append(self.net_G_B(c_list2[-1], t_steps[-1].repeat((x_s.shape[0],)), scale_id=sid_t_last))
                             target_input.append(noise2)
                             pred_img_src = self.model1.sample_from_c_list(batch_size=trg_img.shape[0], c_list=target_input)
 

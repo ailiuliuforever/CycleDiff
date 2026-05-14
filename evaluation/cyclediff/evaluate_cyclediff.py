@@ -191,11 +191,22 @@ def get_t_steps(model, device):
     return t_steps
 
 
+def get_scale_id_for_t(t_val, device):
+    if t_val >= 0.6:
+        return torch.tensor([2], device=device, dtype=torch.long)
+    elif t_val >= 0.3:
+        return torch.tensor([1], device=device, dtype=torch.long)
+    else:
+        return torch.tensor([0], device=device, dtype=torch.long)
+
+
 def translate_c_list(c_list, noise, net_G, t_steps, batch_size):
     target_input = []
     for i in range(len(c_list[:-1])):
-        target_input.append(net_G(c_list[i], t_steps[i + 1].repeat((batch_size,))))
-    target_input.append(net_G(c_list[-1], t_steps[-1].repeat((batch_size,))))
+        sid = get_scale_id_for_t(t_steps[i + 1].item(), c_list[i].device)
+        target_input.append(net_G(c_list[i], t_steps[i + 1].repeat((batch_size,)), scale_id=sid.expand(batch_size)))
+    sid_last = get_scale_id_for_t(t_steps[-1].item(), c_list[-1].device)
+    target_input.append(net_G(c_list[-1], t_steps[-1].repeat((batch_size,)), scale_id=sid_last.expand(batch_size)))
     target_input.append(noise)
     return target_input
 
@@ -814,9 +825,11 @@ def evaluate_identity(model1, model2, net_G_A, net_G_B, dataloader_a, dataloader
 
                 idt_c_list = []
                 for i in range(len(c_list[:-1])):
-                    idt_c = net_G_B(c_list[i], t_steps1[i + 1].repeat((batch_size,)))
+                    sid = get_scale_id_for_t(t_steps1[i + 1].item(), device)
+                    idt_c = net_G_B(c_list[i], t_steps1[i + 1].repeat((batch_size,)), scale_id=sid.expand(batch_size))
                     idt_c_list.append(idt_c)
-                idt_c_last = net_G_B(c_list[-1], t_steps1[-1].repeat((batch_size,)))
+                sid_last = get_scale_id_for_t(t_steps1[-1].item(), device)
+                idt_c_last = net_G_B(c_list[-1], t_steps1[-1].repeat((batch_size,)), scale_id=sid_last.expand(batch_size))
                 idt_c_list.append(idt_c_last)
 
                 for i in range(len(c_list)):
@@ -873,9 +886,11 @@ def evaluate_identity(model1, model2, net_G_A, net_G_B, dataloader_a, dataloader
 
                 idt_c_list = []
                 for i in range(len(c_list[:-1])):
-                    idt_c = net_G_A(c_list[i], t_steps2[i + 1].repeat((batch_size,)))
+                    sid = get_scale_id_for_t(t_steps2[i + 1].item(), device)
+                    idt_c = net_G_A(c_list[i], t_steps2[i + 1].repeat((batch_size,)), scale_id=sid.expand(batch_size))
                     idt_c_list.append(idt_c)
-                idt_c_last = net_G_A(c_list[-1], t_steps2[-1].repeat((batch_size,)))
+                sid_last = get_scale_id_for_t(t_steps2[-1].item(), device)
+                idt_c_last = net_G_A(c_list[-1], t_steps2[-1].repeat((batch_size,)), scale_id=sid_last.expand(batch_size))
                 idt_c_list.append(idt_c_last)
 
                 for i in range(len(c_list)):
@@ -939,9 +954,11 @@ def visualize_c_components(model1, model2, net_G_A, net_G_B, dataloader_a, datal
 
                 translated_c_list = []
                 for i in range(len(c_list[:-1])):
-                    translated_c = net_G_A(c_list[i], t_steps1[i + 1].repeat((batch_size,)))
+                    sid = get_scale_id_for_t(t_steps1[i + 1].item(), device)
+                    translated_c = net_G_A(c_list[i], t_steps1[i + 1].repeat((batch_size,)), scale_id=sid.expand(batch_size))
                     translated_c_list.append(translated_c)
-                translated_c_last = net_G_A(c_list[-1], t_steps1[-1].repeat((batch_size,)))
+                sid_last = get_scale_id_for_t(t_steps1[-1].item(), device)
+                translated_c_last = net_G_A(c_list[-1], t_steps1[-1].repeat((batch_size,)), scale_id=sid_last.expand(batch_size))
                 translated_c_list.append(translated_c_last)
 
                 n_timesteps = len(c_list)
@@ -986,9 +1003,11 @@ def visualize_c_components(model1, model2, net_G_A, net_G_B, dataloader_a, datal
 
                 translated_c_list = []
                 for i in range(len(c_list[:-1])):
-                    translated_c = net_G_B(c_list[i], t_steps2[i + 1].repeat((batch_size,)))
+                    sid = get_scale_id_for_t(t_steps2[i + 1].item(), device)
+                    translated_c = net_G_B(c_list[i], t_steps2[i + 1].repeat((batch_size,)), scale_id=sid.expand(batch_size))
                     translated_c_list.append(translated_c)
-                translated_c_last = net_G_B(c_list[-1], t_steps2[-1].repeat((batch_size,)))
+                sid_last = get_scale_id_for_t(t_steps2[-1].item(), device)
+                translated_c_last = net_G_B(c_list[-1], t_steps2[-1].repeat((batch_size,)), scale_id=sid_last.expand(batch_size))
                 translated_c_list.append(translated_c_last)
 
                 n_timesteps = len(c_list)
@@ -1043,9 +1062,11 @@ def calculate_c_space_metrics(model1, model2, net_G_A, net_G_B, dataloader_a, da
 
                 translated_c_list = []
                 for i in range(len(c_list[:-1])):
-                    translated_c = net_G_A(c_list[i], t_steps1[i + 1].repeat((batch_size,)))
+                    sid = get_scale_id_for_t(t_steps1[i + 1].item(), device)
+                    translated_c = net_G_A(c_list[i], t_steps1[i + 1].repeat((batch_size,)), scale_id=sid.expand(batch_size))
                     translated_c_list.append(translated_c)
-                translated_c_last = net_G_A(c_list[-1], t_steps1[-1].repeat((batch_size,)))
+                sid_last = get_scale_id_for_t(t_steps1[-1].item(), device)
+                translated_c_last = net_G_A(c_list[-1], t_steps1[-1].repeat((batch_size,)), scale_id=sid_last.expand(batch_size))
                 translated_c_list.append(translated_c_last)
 
                 target_input = translated_c_list + [noise]
@@ -1110,9 +1131,11 @@ def calculate_c_space_metrics(model1, model2, net_G_A, net_G_B, dataloader_a, da
 
                 translated_c_list = []
                 for i in range(len(c_list[:-1])):
-                    translated_c = net_G_B(c_list[i], t_steps2[i + 1].repeat((batch_size,)))
+                    sid = get_scale_id_for_t(t_steps2[i + 1].item(), device)
+                    translated_c = net_G_B(c_list[i], t_steps2[i + 1].repeat((batch_size,)), scale_id=sid.expand(batch_size))
                     translated_c_list.append(translated_c)
-                translated_c_last = net_G_B(c_list[-1], t_steps2[-1].repeat((batch_size,)))
+                sid_last = get_scale_id_for_t(t_steps2[-1].item(), device)
+                translated_c_last = net_G_B(c_list[-1], t_steps2[-1].repeat((batch_size,)), scale_id=sid_last.expand(batch_size))
                 translated_c_list.append(translated_c_last)
 
                 target_input = translated_c_list + [noise]
@@ -1158,6 +1181,84 @@ def calculate_c_space_metrics(model1, model2, net_G_A, net_G_B, dataloader_a, da
               f"余弦相似度: {results['B2A_c_metrics']['c_cos_mean']:.4f}")
 
     return results
+
+
+def calculate_fid_kid_is_metrics(save_dir, direction="both", paired=False):
+    """Calculate FID, KID, IS metrics using fidelity CLI tool."""
+    metrics = {}
+    import subprocess
+    import tempfile
+
+    directions_to_eval = []
+    if direction in ["A2B", "both"]:
+        directions_to_eval.append(("A2B", "A2B_translation"))
+    if direction in ["B2A", "both"]:
+        directions_to_eval.append(("B2A", "B2A_translation"))
+
+    for dir_tag, dir_name in directions_to_eval:
+        trans_dir = os.path.join(save_dir, dir_name)
+        translated_path = os.path.join(trans_dir, "translated")
+        if paired:
+            reference_path = os.path.join(trans_dir, "target_gt")
+        else:
+            reference_path = os.path.join(trans_dir, "source")
+
+        if not os.path.exists(translated_path) or not os.path.exists(reference_path):
+            print(f"  {dir_tag}: 跳过（目录不存在）")
+            continue
+
+        print(f"\n正在计算 {dir_tag} FID/KID/IS (vs {'目标域GT' if paired else '源域'})...")
+
+        # FID and KID
+        fid_kid_cmd = (f"fidelity -g 0 -f -i -k -b 16 "
+                       f"--input1 \"{translated_path}\" "
+                       f"--input2 \"{reference_path}\" "
+                       f"--kid-subset-size 50")
+        try:
+            result = subprocess.run(fid_kid_cmd, shell=True, capture_output=True, text=True, timeout=300)
+            output = result.stdout + result.stderr
+            # Parse output
+            fid_val, kid_val, is_mean, is_std = None, None, None, None
+            for line in output.split('\n'):
+                if 'frechet_inception_distance' in line.lower():
+                    try:
+                        fid_val = float(line.split(':')[-1].strip())
+                    except ValueError:
+                        pass
+                if 'kernel_inception_distance_mean' in line.lower():
+                    try:
+                        kid_val = float(line.split(':')[-1].strip())
+                    except ValueError:
+                        pass
+                if 'inception_score_mean' in line.lower():
+                    try:
+                        is_mean = float(line.split(':')[-1].strip())
+                    except ValueError:
+                        pass
+                if 'inception_score_std' in line.lower():
+                    try:
+                        is_std = float(line.split(':')[-1].strip())
+                    except ValueError:
+                        pass
+
+            if fid_val is not None:
+                print(f"  FID: {fid_val:.4f}")
+            if kid_val is not None:
+                print(f"  KID: {kid_val:.6f}")
+            if is_mean is not None:
+                print(f"  IS: {is_mean:.4f} ± {is_std:.4f}" if is_std else f"  IS: {is_mean:.4f}")
+
+            metrics[dir_tag] = {
+                'fid': fid_val, 'kid': kid_val,
+                'is_mean': is_mean, 'is_std': is_std,
+                'reference': 'target_gt' if paired else 'source',
+            }
+        except subprocess.TimeoutExpired:
+            print(f"  {dir_tag}: FID/KID 计算超时")
+        except Exception as e:
+            print(f"  {dir_tag}: FID/KID 计算失败: {e}")
+
+    return metrics
 
 
 def calculate_translation_metrics(save_dir, direction="both", paired=False):
@@ -1482,6 +1583,9 @@ def main(args):
 
         recon_metrics = calculate_translation_metrics(args.save_dir, args.direction, paired=args.paired)
         all_metrics['reconstruction'] = recon_metrics
+
+        fid_kid_metrics = calculate_fid_kid_is_metrics(args.save_dir, args.direction, paired=args.paired)
+        all_metrics['fid_kid'] = fid_kid_metrics
 
         c_metrics = calculate_c_space_metrics(
             model1, model2, net_G_A, net_G_B, dataloader_a, dataloader_b,

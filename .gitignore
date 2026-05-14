@@ -5,6 +5,7 @@ kl-f4/
 results/
 evaluation/vae/res
 evaluation/ldm/res
+evaluation/
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

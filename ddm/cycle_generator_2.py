@@ -397,6 +397,10 @@ class ResnetGenerator_timestep_restime_2_attn(nn.Module):
             nn.Linear(time_dim, time_dim)
         )
 
+        # Scale-ID embedding for scale-disentangled translation (3 scales)
+        self.scale_emb = nn.Embedding(3, 64)
+        self.scale_proj = nn.Linear(time_dim + 64, time_dim)
+
         # init_conv
         self.init_conv = nn.Sequential(
                 nn.Conv2d(input_nc, ngf, kernel_size=7, stride=1, padding=3, padding_mode="reflect", bias=use_bias),
@@ -433,9 +437,19 @@ class ResnetGenerator_timestep_restime_2_attn(nn.Module):
         # self.init_conv.apply(init_func)
         # self.last.apply(init_func)
 
-    def forward(self, input, time):
-        """Standard forward"""
+    def forward(self, input, time, scale_id=None):
+        """Standard forward with optional scale-disentanglement
+
+        Args:
+            input: [B, 3, H, W] input C tensor
+            time:  [B] diffusion timestep
+            scale_id: [B] long tensor, optional scale id (0=fine, 1=coarse)
+        """
         t = self.time_mlp(time)
+        if scale_id is not None:
+            s = self.scale_emb(scale_id)
+            t = torch.cat([t, s], dim=-1)
+            t = self.scale_proj(t)
         x = self.init_conv(input)
         
         for block1, block2, convblock in self.downsample:
@@ -454,6 +468,149 @@ class ResnetGenerator_timestep_restime_2_attn(nn.Module):
             x = convblock(x)
 
         return self.last(x)
+
+
+class ResnetGenerator_timestep_restime_3_mhsa(nn.Module):
+    """Generator with MHSA + time-attention + 2-down bottleneck (16×16).
+
+    1. init_conv: 7x7 Conv(3→ngf) → [B, ngf, 64, 64]
+    2. First down: stride-2 Conv(ngf→ngf*2) → [B, ngf*2, 32, 32]
+    3. Time-attention block at 32×32: ResNetBlock(FiLM) + MHSA
+    4. One more down → bottleneck at 16×16 (256 channels)
+    5. Bottleneck: 12 residual blocks (time-conditioned)
+    6. 2 up-sampling layers → back to 64×64
+    7. Final: 7x7 Conv(ngf→3)
+
+    2-down (16×16 bottleneck) preserves spatial structure to prevent
+    trivial-solution collapse. MHSA at 32×32 (1024 tokens) is GPU-friendly.
+    """
+
+    def __init__(self, input_nc=3, output_nc=3, ngf=64,
+                 norm_layer=functools.partial(nn.InstanceNorm2d, affine=False, track_running_stats=False),
+                 use_dropout=False,
+                 n_blocks=12,
+                 dim=128,
+                 learned_sinusoidal_dim=16,
+                 random_fourier_features=False,
+                 learned_sinusoidal_cond=False,
+                 resnet_block_groups=8,
+                 mhsa_heads=4,
+                 ):
+        assert(n_blocks >= 0)
+        super(ResnetGenerator_timestep_restime_3_mhsa, self).__init__()
+        use_bias = True
+
+        time_dim = dim * 4
+        self.random_or_learned_sinusoidal_cond = learned_sinusoidal_cond or random_fourier_features
+        if self.random_or_learned_sinusoidal_cond:
+            sinu_pos_emb = RandomOrLearnedSinusoidalPosEmb(learned_sinusoidal_dim, random_fourier_features)
+            fourier_dim = learned_sinusoidal_dim + 1
+        else:
+            sinu_pos_emb = SinusoidalPosEmb(dim)
+            fourier_dim = dim
+
+        self.time_mlp = nn.Sequential(
+            sinu_pos_emb,
+            nn.Linear(fourier_dim, time_dim),
+            nn.GELU(),
+            nn.Linear(time_dim, time_dim)
+        )
+
+        self.scale_emb = nn.Embedding(3, 64)
+        self.scale_proj = nn.Linear(time_dim + 64, time_dim)
+
+        # init_conv: 3 → ngf, 64×64
+        self.init_conv = nn.Sequential(
+            nn.Conv2d(input_nc, ngf, kernel_size=7, stride=1, padding=3, padding_mode="reflect", bias=use_bias),
+            norm_layer(ngf),
+            nn.ReLU(True))
+
+        # First down-sampling (64×64 → 32×32, 64 → 128 channels)
+        ta_channels = ngf * 2  # 128
+        self.ta_pre_down = nn.ModuleList([
+            ResnetBlock(ngf, ngf, time_emb_dim=time_dim, groups=resnet_block_groups),
+            ResnetBlock(ngf, ngf, time_emb_dim=time_dim, groups=resnet_block_groups),
+            ConvBlock(ngf, ta_channels, kernel_size=3, stride=2, padding=1, bias=use_bias),
+        ])
+
+        # Time-attention block at 32×32 (1024 tokens, GPU-friendly)
+        self.time_attn_resblock = ResnetBlock(ta_channels, ta_channels, time_emb_dim=time_dim, groups=resnet_block_groups)
+        self.time_attn_mhsa = nn.MultiheadAttention(embed_dim=ta_channels, num_heads=mhsa_heads, batch_first=True)
+        self.time_attn_norm = nn.LayerNorm(ta_channels)
+
+        # One more down-sampling (32×32 → 16×16, 128 → 256 channels) — total 2 downs
+        n_downsampling = 1
+        self.downsample = nn.ModuleList([])
+        for i in range(n_downsampling):
+            mult = 2 ** (i + 1)  # start from 2 (ta_channels at 2×)
+            self.downsample.append(nn.ModuleList([
+                ResnetBlock(ngf * mult, ngf * mult, time_emb_dim=time_dim, groups=resnet_block_groups),
+                ResnetBlock(ngf * mult, ngf * mult, time_emb_dim=time_dim, groups=resnet_block_groups),
+                ConvBlock(ngf * mult, ngf * mult * 2, kernel_size=3, stride=2, padding=1, bias=use_bias),
+            ]))
+
+        # Bottleneck at 16×16, 256 channels (= ngf * 4)
+        total_downs = 2  # 1 pre-down + 1 in downsample
+        mult = 2 ** total_downs  # 4
+        self.residual_blocks = nn.ModuleList([
+            ResnetBlock_time(ngf * mult, norm_layer=norm_layer, use_dropout=use_dropout, use_bias=use_bias, time_dim=time_dim)
+            for _ in range(n_blocks)
+        ])
+
+        # 2 up-sampling layers (16×16 → 32×32 → 64×64)
+        self.upsample = nn.ModuleList([])
+        for i in range(total_downs):
+            mult = 2 ** (total_downs - i)
+            self.upsample.append(nn.ModuleList([
+                ResnetBlock(ngf * mult, ngf * mult, time_emb_dim=time_dim, groups=resnet_block_groups),
+                ResnetBlock(ngf * mult, ngf * mult, time_emb_dim=time_dim, groups=resnet_block_groups),
+                ConvBlock(ngf * mult, int(ngf * mult / 2), down=False, kernel_size=3, stride=2, padding=1, output_padding=1, bias=use_bias),
+            ]))
+
+        self.last = nn.Conv2d(ngf, output_nc, kernel_size=7, stride=1, padding=3, padding_mode="reflect")
+
+    def forward(self, input, time, scale_id=None):
+        t = self.time_mlp(time)
+        if scale_id is not None:
+            s = self.scale_emb(scale_id)
+            t = torch.cat([t, s], dim=-1)
+            t = self.scale_proj(t)
+
+        x = self.init_conv(input)  # [B, 64, 64, 64]
+
+        # Pre-down: 64×64 → 32×32, 64 → 128 channels
+        for layer in self.ta_pre_down:
+            if isinstance(layer, ConvBlock):
+                x = layer(x)
+            else:
+                x = layer(x, t)  # [B, 128, 32, 32]
+
+        # Time-attention at 32×32
+        x = self.time_attn_resblock(x, t)
+        B, C, H, W = x.shape
+        x_seq = x.view(B, C, H * W).permute(0, 2, 1)
+        x_seq = self.time_attn_mhsa(x_seq, x_seq, x_seq)[0]
+        x_seq = self.time_attn_norm(x_seq)
+        x = x_seq.permute(0, 2, 1).view(B, C, H, W)
+
+        # One more down: 32×32 → 16×16
+        for block1, block2, convblock in self.downsample:
+            x = block1(x, t)
+            x = block2(x, t)
+            x = convblock(x)
+
+        # Bottleneck at 16×16
+        for block in self.residual_blocks:
+            x = block(x, t)
+
+        # Upsample: 16×16 → 32×32 → 64×64
+        for block1, block2, convblock in self.upsample:
+            x = block1(x, t)
+            x = block2(x, t)
+            x = convblock(x)
+
+        return self.last(x)
+
 
 def normalize(in_channels):
     return torch.nn.GroupNorm(num_groups=1, num_channels=in_channels, eps=1e-6, affine=False)

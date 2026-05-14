@@ -30,10 +30,8 @@ def calculate_l2_given_paths(path1,path2):
 
 def fid_l2_psnr_ssim(dataset,translate_path,source_path,gt_path):
     path1 = translate_path
-    path2 = source_path
+    path2 = gt_path  # compare generated against target ground truth
 
-    # fid_value = calculate_fid_given_paths(paths=[path1, gt_path], dataset = dataset)
-    # print('fid:{}'.format(fid_value))
     os.system(f"fidelity -g 0 -f -i -k -b 16 --input1 {path1} --input2 {gt_path} --kid-subset-size 50")
 
     l2_distance = calculate_l2_given_paths(path1, path2)
